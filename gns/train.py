@@ -24,8 +24,8 @@ from gns import reading_utils
 flags.DEFINE_enum(
     'mode', 'train', ['train', 'valid', 'rollout'],
     help='Train model, validation or rollout evaluation.')
-flags.DEFINE_integer('batch_size', 2, help='The batch size.')
-flags.DEFINE_float('noise_std', 6.7e-4, help='The std deviation of the noise.')
+flags.DEFINE_integer('batch_size', 1, help='The batch size.')
+flags.DEFINE_float('noise_std', 0, help='The std deviation of the noise.')
 flags.DEFINE_string('data_path', None, help='The dataset directory.')
 flags.DEFINE_string('model_path', 'models/', help=('The path for saving checkpoints of the model.'))
 flags.DEFINE_string('output_path', 'rollouts/', help='The path for saving outputs (e.g. rollouts).')
@@ -46,7 +46,7 @@ FLAGS = flags.FLAGS
 
 Stats = collections.namedtuple('Stats', ['mean', 'std'])
 
-INPUT_SEQUENCE_LENGTH = 6  # So we can calculate the last 5 velocities.
+INPUT_SEQUENCE_LENGTH = 1  # So we can calculate the last 5 velocities.
 NUM_PARTICLE_TYPES = 9
 KINEMATIC_PARTICLE_ID = 3
 
@@ -179,8 +179,8 @@ def prepare_input_data(
     # Splits a chunk into input steps and target steps
     ds = ds.map(prepare_inputs)
     # If in train mode, repeat dataset forever and shuffle.
-    ds = ds.repeat()
-    ds = ds.shuffle(512)
+    # ds = ds.repeat()
+    # ds = ds.shuffle(512)
     # Custom batching on the leading axis.
     ds = batch_concat(ds, batch_size)
 
@@ -376,71 +376,140 @@ def train(
                           batch_size=FLAGS.batch_size)
 
   print(f"device = {device}")
+
+  # tfrecord can contain one or more simulations
+  # these simulations can contain different numbers of particles
+  # to save these in arrays we need to only group those with identical number of particles
+  suite_particle_types = []
+  suite_positions = []
+  suite_n_particle_per_example = []
+  suite_labels = []
+
   try:
+
+    # each grouping of simulations with the same number of particles will be saved as a set
+    # these sets will then be concatenated and appended to the suites above.
+    set_particle_type = []
+    set_position = []
+    set_n_particles_per_example = []
+    set_labels = []
+
+    previous_num_particles = None
     for features, labels in ds:
-      features['position'] = torch.tensor(
-          features['position']).to(device)
-      features['n_particles_per_example'] = torch.tensor(
-          features['n_particles_per_example']).to(device)
-      features['particle_type'] = torch.tensor(
-          features['particle_type']).to(device)
-      labels = torch.tensor(labels).to(device)
+      position = features['position']
+      n_particles_per_example = features["n_particles_per_example"]
+      particle_type = features["particle_type"]
+      # labels = labels
 
-      # Sample the noise to add to the inputs to the model during training.
-      sampled_noise = noise_utils.get_random_walk_noise_for_position_sequence(
-          features['position'], noise_std_last_step=FLAGS.noise_std).to(device)
-      non_kinematic_mask = (
-          features['particle_type'] != 3).clone().detach().to(device)
-      sampled_noise *= non_kinematic_mask.view(-1, 1, 1)
+      if previous_num_particles is None:
+        previous_num_particles = n_particles_per_example
 
-      # Get the predictions and target accelerations.
-      pred_acc, target_acc = simulator.predict_accelerations(
-          next_positions=labels.to(device),
-          position_sequence_noise=sampled_noise.to(device),
-          position_sequence=features['position'].to(device),
-          nparticles_per_example=features['n_particles_per_example'].to(device),
-          particle_types=features['particle_type'].to(device))
+      if previous_num_particles != n_particles_per_example:
+        # must be starting a new set
+        # append old set to suite
+        suite_particle_types.append(np.concatenate(set_position))
+        suite_positions.append(np.concatenate(set_position))
+        suite_n_particle_per_example.append(np.concatenate(set_n_particles_per_example))
+        suite_labels.append(np.concatenate(set_labels))
 
-      # Calculate the loss and mask out loss on kinematic particles
-      loss = (pred_acc - target_acc) ** 2
-      loss = loss.sum(dim=-1)
-      num_non_kinematic = non_kinematic_mask.sum()
-      loss = torch.where(non_kinematic_mask.bool(),
-                         loss, torch.zeros_like(loss))
-      loss = loss.sum() / num_non_kinematic
+        # then reset the set to begin the next one.
+        set_particle_type = []
+        set_position = []
+        set_n_particles_per_example = []
+        set_labels = []
 
-      # Computes the gradient of loss
-      optimizer.zero_grad()
-      loss.backward()
-      optimizer.step()
+        # reset number of particles for new set
+        previous_num_particles = n_particles_per_example
 
-      # Update learning rate
-      lr_new = FLAGS.lr_init * (FLAGS.lr_decay ** (step/FLAGS.lr_decay_steps))
-      for param in optimizer.param_groups:
-        param['lr'] = lr_new
+      # always append the latest data to the current set.
+      set_particle_type.append(np.array([particle_type]))
+      set_position.append(np.array([position]))
+      set_n_particles_per_example.append(np.array([n_particles_per_example]))
+      set_labels.append(np.array([labels]))
 
-      print('Training step: {}/{}. Loss: {}.'.format(step,
-                                                     FLAGS.ntraining_steps,
-                                                     loss))
-      # Save model state
-      if step % FLAGS.nsave_steps == 0:
-        simulator.save(model_path + 'model-'+str(step)+'.pt')
-        train_state = dict(optimizer_state=optimizer.state_dict(), global_train_state={"step":step})
-        torch.save(train_state, f"{model_path}train_state-{step}.pt")
+      # # Sample the noise to add to the inputs to the model during training.
+      # sampled_noise = noise_utils.get_random_walk_noise_for_position_sequence(
+      #     features['position'], noise_std_last_step=FLAGS.noise_std).to(device)
+      # non_kinematic_mask = (
+      #     features['particle_type'] != 3).clone().detach().to(device)
+      # sampled_noise *= non_kinematic_mask.view(-1, 1, 1)
 
-      # Complete training
-      if (step >= FLAGS.ntraining_steps):
-        break
+      # # Get the predictions and target accelerations.
+      # pred_acc, target_acc = simulator.predict_accelerations(
+      #     next_positions=labels.to(device),
+      #     position_sequence_noise=sampled_noise.to(device),
+      #     position_sequence=features['position'].to(device),
+      #     nparticles_per_example=features['n_particles_per_example'].to(device),
+      #     particle_types=features['particle_type'].to(device))
 
-      step += 1
+      # # Calculate the loss and mask out loss on kinematic particles
+      # loss = (pred_acc - target_acc) ** 2
+      # loss = loss.sum(dim=-1)
+      # num_non_kinematic = non_kinematic_mask.sum()
+      # loss = torch.where(non_kinematic_mask.bool(),
+      #                    loss, torch.zeros_like(loss))
+      # loss = loss.sum() / num_non_kinematic
+
+      # # Computes the gradient of loss
+      # optimizer.zero_grad()
+      # loss.backward()
+      # optimizer.step()
+
+      # # Update learning rate
+      # lr_new = FLAGS.lr_init * (FLAGS.lr_decay ** (step/FLAGS.lr_decay_steps))
+      # for param in optimizer.param_groups:
+      #   param['lr'] = lr_new
+
+      # print('Training step: {}/{}. Loss: {}.'.format(step,
+      #                                                FLAGS.ntraining_steps,
+      #                                                loss))
+      # # Save model state
+      # if step % FLAGS.nsave_steps == 0:
+      #   simulator.save(model_path + 'model-'+str(step)+'.pt')
+      #   train_state = dict(optimizer_state=optimizer.state_dict(), global_train_state={"step":step})
+      #   torch.save(train_state, f"{model_path}train_state-{step}.pt")
+
+      # # Complete training
+      # if (step >= FLAGS.ntraining_steps):
+      #   break
+
+      # step += 1
 
   except KeyboardInterrupt:
     pass
 
-  simulator.save(model_path + 'model-'+str(step)+'.pt')
-  train_state = dict(optimizer_state=optimizer.state_dict(), global_train_state={"step":step})
-  torch.save(train_state, f"{model_path}train_state-{step}.pt")
+  # print(len(series_particle_type), series_particle_type[0].shape)
+  # print(len(series_position), series_position[0].shape)
+  # print(len(series_n_particles_per_example), series_n_particles_per_example[0].shape)
+  # print(len(series_labels), series_labels[0].shape)
 
+  # print(series_labels[0], series_labels[1], series_labels[2])
+
+  # simulator.save(model_path + 'model-'+str(step)+'.pt')
+  # train_state = dict(optimizer_state=optimizer.state_dict(), global_train_state={"step":step})
+  # torch.save(train_state, f"{model_path}train_state-{step}.pt")
+
+  # series_particle_type = np.concatenate(series_particle_type)
+  # series_position = np.concatenate(series_position)
+  # series_n_particles_per_example = np.concatenate(series_n_particles_per_example)
+  # series_labels = np.concatenate(series_labels)
+
+  suite_particle_types.append(np.concatenate(set_position))
+  suite_positions.append(np.concatenate(set_position))
+  suite_n_particle_per_example.append(np.concatenate(set_n_particles_per_example))
+  suite_labels.append(np.concatenate(set_labels))
+
+
+  np.savez_compressed("train.npz",
+                      **{f"particle_type_{key}" : value for key, value in enumerate(suite_particle_types)},
+                      **{f"position_{key}" : value for key, value in enumerate(suite_positions)},
+                      **{f"n_particles_per_example_{key}" : value for key, value in enumerate(suite_n_particle_per_example)},
+                      **{f"label_{key}" : value for key, value in enumerate(suite_labels)},
+  )
+  # np.save("train_ptype.npy", series_particle_type)
+  # np.save("train_position.npy", series_position)
+  # np.save("train_nparticles.npy", series_n_particles_per_example)
+  # np.save("train_labels.npy", series_labels)
 
 def _get_simulator(
         metadata: json,
