@@ -396,9 +396,9 @@ def train(
 
     previous_num_particles = None
     for features, labels in ds:
+      particle_type = features["particle_type"]
       position = features['position']
       n_particles_per_example = features["n_particles_per_example"]
-      particle_type = features["particle_type"]
       # labels = labels
 
       if previous_num_particles is None:
@@ -407,7 +407,7 @@ def train(
       if previous_num_particles != n_particles_per_example:
         # must be starting a new set
         # append old set to suite
-        suite_particle_types.append(np.concatenate(set_position))
+        suite_particle_types.append(np.concatenate(set_particle_type))
         suite_positions.append(np.concatenate(set_position))
         suite_n_particle_per_example.append(np.concatenate(set_n_particles_per_example))
         suite_labels.append(np.concatenate(set_labels))
@@ -494,7 +494,7 @@ def train(
   # series_n_particles_per_example = np.concatenate(series_n_particles_per_example)
   # series_labels = np.concatenate(series_labels)
 
-  suite_particle_types.append(np.concatenate(set_position))
+  suite_particle_types.append(np.concatenate(set_particle_type))
   suite_positions.append(np.concatenate(set_position))
   suite_n_particle_per_example.append(np.concatenate(set_n_particles_per_example))
   suite_labels.append(np.concatenate(set_labels))
