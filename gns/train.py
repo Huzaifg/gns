@@ -163,6 +163,7 @@ def prepare_input_data(
   tf.config.set_visible_devices([], 'GPU')
 
   # Create a tf.data.Dataset from the TFRecord.
+  split = "train"
   ds = tf.data.TFRecordDataset([os.path.join(data_path, f'{split}.tfrecord')])
   ds = ds.map(functools.partial(
       reading_utils.parse_serialized_simulation_example, metadata=metadata))
@@ -499,8 +500,8 @@ def train(
   suite_n_particle_per_example.append(np.concatenate(set_n_particles_per_example))
   suite_labels.append(np.concatenate(set_labels))
 
-
-  np.savez_compressed("train.npz",
+  split = "train"
+  np.savez_compressed(f"{split}.npz",
                       **{f"particle_type_{key}" : value for key, value in enumerate(suite_particle_types)},
                       **{f"position_{key}" : value for key, value in enumerate(suite_positions)},
                       **{f"n_particles_per_example_{key}" : value for key, value in enumerate(suite_n_particle_per_example)},
