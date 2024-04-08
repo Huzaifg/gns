@@ -20,6 +20,7 @@ from gns import noise_utils
 from gns import reading_utils
 from gns import data_loader
 from gns import distribute
+import time
 
 flags.DEFINE_enum(
     'mode', 'train', ['train', 'valid', 'rollout'],
@@ -39,6 +40,7 @@ flags.DEFINE_integer('nsave_steps', int(5000), help='Number of steps at which to
 # Learning rate parameters
 flags.DEFINE_float('lr_init', 1e-4, help='Initial learning rate.')
 flags.DEFINE_float('lr_decay', 0.1, help='Learning rate decay.')
+flags.DEFINE_float('con_radius', 0.025, help='Connectivity Radius')
 flags.DEFINE_integer('lr_decay_steps', int(5e6), help='Learning rate decay steps.')
 
 flags.DEFINE_integer("cuda_device_number", None, help="CUDA device (zero indexed), default is None so default CUDA device will be used.")
@@ -79,6 +81,7 @@ def rollout(
   current_positions = initial_positions
   predictions = []
 
+  start = time.time()
   for step in tqdm(range(nsteps), total=nsteps):
     # Get next position with shape (nnodes, dim)
     next_position = simulator.predict_positions(
@@ -87,7 +90,6 @@ def rollout(
         particle_types=particle_types,
         material_property=material_property
     )
-
     # Update kinematic particles from prescribed trajectory.
     kinematic_mask = (particle_types == KINEMATIC_PARTICLE_ID).clone().detach().to(device)
     next_position_ground_truth = ground_truth_positions[:, step]
@@ -101,6 +103,9 @@ def rollout(
     current_positions = torch.cat(
         [current_positions[:, 1:], next_position[:, None, :]], dim=1)
 
+  end = time.time()
+  print(f"Time taken for rollout: {end - start}")
+  print(f"Num of edges: {simulator._num_edges}")
   # Predictions with shape (time, nnodes, dim)
   predictions = torch.stack(predictions)
   ground_truth_positions = ground_truth_positions.permute(1, 0, 2)
@@ -127,6 +132,9 @@ def predict(device: str):
   """
   # Read metadata
   metadata = reading_utils.read_metadata(FLAGS.data_path, "rollout")
+  con_radius = FLAGS.con_radius
+  if con_radius is not None:
+    metadata["default_connectivity_radius"] = FLAGS.con_radius
   simulator = _get_simulator(metadata, FLAGS.noise_std, FLAGS.noise_std, device)
 
   # Load simulator
@@ -159,6 +167,7 @@ def predict(device: str):
   with torch.no_grad():
     for example_i, features in enumerate(ds):
       positions = features[0].to(device)
+      print(f"Number of particles: {positions.shape[0]}")
       if metadata['sequence_length'] is not None:
         # If `sequence_length` is predefined in metadata,
         nsteps = metadata['sequence_length'] - INPUT_SEQUENCE_LENGTH
@@ -230,6 +239,9 @@ def train(rank, flags, world_size, device):
   # Read metadata
   metadata = reading_utils.read_metadata(flags["data_path"], "train")
 
+  con_radius = FLAGS.con_radius
+  if con_radius is not None:
+    metadata["default_connectivity_radius"] = con_radius
   # Get simulator and optimizer
   if device == torch.device("cuda"):
     serial_simulator = _get_simulator(metadata, flags["noise_std"], flags["noise_std"], rank)
@@ -431,7 +443,8 @@ def _get_simulator(
     # (position (dim), velocity (dim*6), particle_type (16)),
     nnode_in = 37 if metadata['dim'] == 3 else 30
     nedge_in = metadata['dim'] + 1
-
+  conn = metadata["default_connectivity_radius"]
+  print(f"connectivity radius is set to: {conn}")
   # Init simulator.
   simulator = learned_simulator.LearnedSimulator(
       particle_dimensions=metadata['dim'],
@@ -441,7 +454,7 @@ def _get_simulator(
       nmessage_passing_steps=10,
       nmlp_layers=2,
       mlp_hidden_dim=128,
-      connectivity_radius=metadata['default_connectivity_radius'],
+      connectivity_radius=metadata["default_connectivity_radius"],
       boundaries=np.array(metadata['bounds']),
       normalization_stats=normalization_stats,
       nparticle_types=NUM_PARTICLE_TYPES,
@@ -449,6 +462,8 @@ def _get_simulator(
       boundary_clamp_limit=metadata["boundary_augment"] if "boundary_augment" in metadata else 1.0,
       device=device)
 
+  num_params = sum(p.numel() for p in simulator.parameters() if p.requires_grad)
+  print(f"Number of Parameters {num_params}")
   return simulator
 
 

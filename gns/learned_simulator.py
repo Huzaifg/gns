@@ -55,6 +55,7 @@ class LearnedSimulator(nn.Module):
     self._normalization_stats = normalization_stats
     self._nparticle_types = nparticle_types
     self._boundary_clamp_limit = boundary_clamp_limit
+    self._num_edges = 0
 
     # Particle type embedding has shape (9, 16)
     self._particle_type_embedding = nn.Embedding(
@@ -105,7 +106,7 @@ class LearnedSimulator(nn.Module):
     # "source_to_target"
     receivers = edge_index[0, :]
     senders = edge_index[1, :]
-
+    self._num_edges = senders.shape[0]
     return receivers, senders
 
   def _encoder_preprocessor(
