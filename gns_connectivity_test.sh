@@ -5,7 +5,7 @@
 #SBATCH -e Otest_%a.err
 #SBATCH -p gpu-a100-small
 #SBATCH -A BCS20003
-#SBATCH -N 2               # Total # of nodes (must be 1 for serial)
+#SBATCH -N 1               # Total # of nodes (must be 1 for serial)
 #SBATCH -n 1               # Total # of mpi tasks (should be 1 for serial)
 #SBATCH --array=1-10%10    # Launch 10 tasks, you can adjust concurrency with the % parameter
 
