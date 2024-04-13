@@ -36,7 +36,7 @@ flags.DEFINE_string('output_filename', 'rollout', help='Base name for saving the
 flags.DEFINE_string('model_file', None, help=('Model filename (.pt) to resume from. Can also use "latest" to default to newest file.'))
 flags.DEFINE_string('train_state_file', 'train_state.pt', help=('Train state filename (.pt) to resume from. Can also use "latest" to default to newest file.'))
 
-flags.DEFINE_boolean('use_amp', False, 'Use Automatic Mixed Precision for training')
+flags.DEFINE_boolean('use_amp', bool(0), 'Use Automatic Mixed Precision for training')
 
 flags.DEFINE_integer('ntraining_steps', int(2E7), help='Number of training steps.')
 flags.DEFINE_integer('nsave_steps', int(5000), help='Number of steps at which to save the model.')
@@ -44,7 +44,7 @@ flags.DEFINE_integer('nsave_steps', int(5000), help='Number of steps at which to
 # Learning rate parameters
 flags.DEFINE_float('lr_init', 1e-4, help='Initial learning rate.')
 flags.DEFINE_float('lr_decay', 0.1, help='Learning rate decay.')
-flags.DEFINE_float('con_radius', 0.025, help='Connectivity Radius')
+flags.DEFINE_float('con_radius', None, help='Connectivity Radius')
 flags.DEFINE_integer('lr_decay_steps', int(5e6), help='Learning rate decay steps.')
 
 flags.DEFINE_integer("cuda_device_number", None, help="CUDA device (zero indexed), default is None so default CUDA device will be used.")
@@ -85,6 +85,7 @@ def rollout(
 
   current_positions = initial_positions
   predictions = []
+  print(f"Using amp: {flags['use_amp']}")
   with autocast(dtype = torch.float16, enabled = flags["use_amp"]):
     start = time.time()
  
@@ -153,6 +154,7 @@ def predict(device: str):
 
   simulator.to(device)
   simulator.eval()
+  torch.compile(simulator)
 
   # Output path
   if not os.path.exists(FLAGS.output_path):
@@ -248,6 +250,7 @@ def train(rank, flags, world_size, device):
 
   # Read metadata
   metadata = reading_utils.read_metadata(flags["data_path"], "train")
+  print(f"Using amp: {flags['use_amp']}")
 
   con_radius = FLAGS.con_radius
   if con_radius is not None:
@@ -291,7 +294,6 @@ def train(rank, flags, world_size, device):
       # set optimizer state
       optimizer = torch.optim.Adam(
         simulator.module.parameters() if device == torch.device("cuda") else simulator.parameters())
-      print(f"Using amp: {flags['use_amp']}")
       optimizer.load_state_dict(train_state["optimizer_state"])
       if "scaler" in train_state:
           scaler.load_state_dict(train_state["scaler"])
@@ -305,6 +307,7 @@ def train(rank, flags, world_size, device):
 
   simulator.train()
   simulator.to(device_id)
+  torch.compile(simulator, mode = "max-autotune")
 
   if device == torch.device("cuda"):
     dl = distribute.get_data_distributed_dataloader_by_samples(path=f'{flags["data_path"]}train.npz',
