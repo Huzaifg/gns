@@ -22,6 +22,8 @@ from gns import data_loader
 from gns import distribute
 import time
 
+from torch.cuda.amp import GradScaler, autocast
+
 flags.DEFINE_enum(
     'mode', 'train', ['train', 'valid', 'rollout'],
     help='Train model, validation or rollout evaluation.')
@@ -33,6 +35,8 @@ flags.DEFINE_string('output_path', 'rollouts/', help='The path for saving output
 flags.DEFINE_string('output_filename', 'rollout', help='Base name for saving the rollout')
 flags.DEFINE_string('model_file', None, help=('Model filename (.pt) to resume from. Can also use "latest" to default to newest file.'))
 flags.DEFINE_string('train_state_file', 'train_state.pt', help=('Train state filename (.pt) to resume from. Can also use "latest" to default to newest file.'))
+
+flags.DEFINE_boolean('use_amp', False, 'Use Automatic Mixed Precision for training')
 
 flags.DEFINE_integer('ntraining_steps', int(2E7), help='Number of training steps.')
 flags.DEFINE_integer('nsave_steps', int(5000), help='Number of steps at which to save the model.')
@@ -47,6 +51,7 @@ flags.DEFINE_integer("cuda_device_number", None, help="CUDA device (zero indexed
 flags.DEFINE_integer("n_gpus", 1, help="The number of GPUs to utilize for training")
 
 FLAGS = flags.FLAGS
+
 
 Stats = collections.namedtuple('Stats', ['mean', 'std'])
 
@@ -80,28 +85,29 @@ def rollout(
 
   current_positions = initial_positions
   predictions = []
+  with autocast(dtype = torch.float16, enabled = flags["use_amp"]):
+    start = time.time()
+ 
+    for step in tqdm(range(nsteps), total=nsteps):
+      # Get next position with shape (nnodes, dim)
+      next_position = simulator.predict_positions(
+          current_positions,
+          nparticles_per_example=[n_particles_per_example],
+          particle_types=particle_types,
+          material_property=material_property
+      )
+      # Update kinematic particles from prescribed trajectory.
+      kinematic_mask = (particle_types == KINEMATIC_PARTICLE_ID).clone().detach().to(device)
+      next_position_ground_truth = ground_truth_positions[:, step]
+      kinematic_mask = kinematic_mask.bool()[:, None].expand(-1, current_positions.shape[-1])
+      next_position = torch.where(
+          kinematic_mask, next_position_ground_truth, next_position)
+      predictions.append(next_position)
 
-  start = time.time()
-  for step in tqdm(range(nsteps), total=nsteps):
-    # Get next position with shape (nnodes, dim)
-    next_position = simulator.predict_positions(
-        current_positions,
-        nparticles_per_example=[n_particles_per_example],
-        particle_types=particle_types,
-        material_property=material_property
-    )
-    # Update kinematic particles from prescribed trajectory.
-    kinematic_mask = (particle_types == KINEMATIC_PARTICLE_ID).clone().detach().to(device)
-    next_position_ground_truth = ground_truth_positions[:, step]
-    kinematic_mask = kinematic_mask.bool()[:, None].expand(-1, current_positions.shape[-1])
-    next_position = torch.where(
-        kinematic_mask, next_position_ground_truth, next_position)
-    predictions.append(next_position)
-
-    # Shift `current_positions`, removing the oldest position in the sequence
-    # and appending the next position at the end.
-    current_positions = torch.cat(
-        [current_positions[:, 1:], next_position[:, None, :]], dim=1)
+      # Shift `current_positions`, removing the oldest position in the sequence
+      # and appending the next position at the end.
+      current_positions = torch.cat(
+          [current_positions[:, 1:], next_position[:, None, :]], dim=1)
 
   end = time.time()
   print(f"Time taken for rollout: {end - start}")
@@ -130,10 +136,12 @@ def predict(device: str):
     simulator: Trained simulator if not will undergo training.
 
   """
+  if not FLAGS.is_parsed():
+    FLAGS(sys.argv, known_only=True)
   # Read metadata
   metadata = reading_utils.read_metadata(FLAGS.data_path, "rollout")
-  con_radius = FLAGS.con_radius
-  if con_radius is not None:
+  if FLAGS.con_radius is not None:
+    con_radius = FLAGS.con_radius
     metadata["default_connectivity_radius"] = FLAGS.con_radius
   simulator = _get_simulator(metadata, FLAGS.noise_std, FLAGS.noise_std, device)
 
@@ -230,6 +238,8 @@ def train(rank, flags, world_size, device):
     world_size: total number of ranks
     device: torch device type
   """
+  if not FLAGS.is_parsed():
+    FLAGS(sys.argv, known_only=True)
   if device == torch.device("cuda"):
     distribute.setup(rank, world_size, device)
     device_id = rank
@@ -243,6 +253,7 @@ def train(rank, flags, world_size, device):
   if con_radius is not None:
     metadata["default_connectivity_radius"] = con_radius
   # Get simulator and optimizer
+  scaler = GradScaler(enabled = flags["use_amp"]) #Grad scaler to prevent gradient vanishing with amp
   if device == torch.device("cuda"):
     serial_simulator = _get_simulator(metadata, flags["noise_std"], flags["noise_std"], rank)
     simulator = DDP(serial_simulator.to(rank), device_ids=[rank], output_device=rank)
@@ -280,7 +291,10 @@ def train(rank, flags, world_size, device):
       # set optimizer state
       optimizer = torch.optim.Adam(
         simulator.module.parameters() if device == torch.device("cuda") else simulator.parameters())
+      print(f"Using amp: {flags['use_amp']}")
       optimizer.load_state_dict(train_state["optimizer_state"])
+      if "scaler" in train_state:
+          scaler.load_state_dict(train_state["scaler"])
       optimizer_to(optimizer, device_id)
       # set global train state
       step = train_state["global_train_state"].pop("step")
@@ -333,14 +347,23 @@ def train(rank, flags, world_size, device):
 
         # Get the predictions and target accelerations.
         if device == torch.device("cuda"):
-          pred_acc, target_acc = simulator.module.predict_accelerations(
-            next_positions=labels.to(rank),
-            position_sequence_noise=sampled_noise.to(rank),
-            position_sequence=position.to(rank),
-            nparticles_per_example=n_particles_per_example.to(rank),
-            particle_types=particle_type.to(rank),
-            material_property=material_property.to(rank) if n_features == 3 else None
-          )
+          with autocast(dtype = torch.float16, enabled = flags["use_amp"]):
+            pred_acc, target_acc = simulator.module.predict_accelerations(
+              next_positions=labels.to(rank),
+              position_sequence_noise=sampled_noise.to(rank),
+              position_sequence=position.to(rank),
+              nparticles_per_example=n_particles_per_example.to(rank),
+              particle_types=particle_type.to(rank),
+              material_property=material_property.to(rank) if n_features == 3 else None
+            )
+            # Calculate the loss and mask out loss on kinematic particles
+            loss = (pred_acc - target_acc) ** 2
+            loss = loss.sum(dim=-1)
+            num_non_kinematic = non_kinematic_mask.sum()
+            loss = torch.where(non_kinematic_mask.bool(),
+                          loss, torch.zeros_like(loss))
+            loss = loss.sum() / num_non_kinematic
+
         else:
           pred_acc, target_acc = simulator.predict_accelerations(
             next_positions=labels.to(device),
@@ -350,19 +373,22 @@ def train(rank, flags, world_size, device):
             particle_types=particle_type.to(device),
             material_property=material_property.to(rank) if n_features == 3 else None
           )
-
-        # Calculate the loss and mask out loss on kinematic particles
-        loss = (pred_acc - target_acc) ** 2
-        loss = loss.sum(dim=-1)
-        num_non_kinematic = non_kinematic_mask.sum()
-        loss = torch.where(non_kinematic_mask.bool(),
-                         loss, torch.zeros_like(loss))
-        loss = loss.sum() / num_non_kinematic
+          # Calculate the loss and mask out loss on kinematic particles
+          loss = (pred_acc - target_acc) ** 2
+          loss = loss.sum(dim=-1)
+          num_non_kinematic = non_kinematic_mask.sum()
+          loss = torch.where(non_kinematic_mask.bool(),
+                          loss, torch.zeros_like(loss))
+          loss = loss.sum() / num_non_kinematic
 
         # Computes the gradient of loss
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # loss.backward()
+        # optimizer.step()
+        scaler.scale(loss).backward() # calculate scaled gradients
+        scaler.step(optimizer)
+        scaler.update()
+
 
         # Update learning rate
         lr_new = flags["lr_init"] * (flags["lr_decay"] ** (step/flags["lr_decay_steps"])) * world_size
@@ -378,6 +404,7 @@ def train(rank, flags, world_size, device):
             else:
               simulator.module.save(flags["model_path"] + 'model-'+str(step)+'.pt')
             train_state = dict(optimizer_state=optimizer.state_dict(),
+                               scaler = scaler.state_dict(),
                                global_train_state={"step": step},
                                loss=loss.item())
             torch.save(train_state, f'{flags["model_path"]}train_state-{step}.pt')
