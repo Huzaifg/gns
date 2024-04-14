@@ -85,8 +85,8 @@ def rollout(
 
   current_positions = initial_positions
   predictions = []
-  print(f"Using amp: {flags['use_amp']}")
-  with autocast(dtype = torch.float16, enabled = flags["use_amp"]):
+  print(f"Using amp: {FLAGS.use_amp}", flush=True)
+  with autocast(dtype = torch.float16, enabled = FLAGS.use_amp):
     start = time.time()
  
     for step in tqdm(range(nsteps), total=nsteps):
@@ -110,14 +110,14 @@ def rollout(
       current_positions = torch.cat(
           [current_positions[:, 1:], next_position[:, None, :]], dim=1)
 
-  end = time.time()
-  print(f"Time taken for rollout: {end - start}")
-  print(f"Num of edges: {simulator._num_edges}")
-  # Predictions with shape (time, nnodes, dim)
-  predictions = torch.stack(predictions)
-  ground_truth_positions = ground_truth_positions.permute(1, 0, 2)
+    end = time.time()
+    print(f"Time taken for rollout: {end - start}")
+    print(f"Num of edges: {simulator._num_edges}")
+    # Predictions with shape (time, nnodes, dim)
+    predictions = torch.stack(predictions)
+    ground_truth_positions = ground_truth_positions.permute(1, 0, 2)
 
-  loss = (predictions - ground_truth_positions) ** 2
+    loss = (predictions - ground_truth_positions) ** 2
 
   output_dict = {
       'initial_positions': initial_positions.permute(1, 0, 2).cpu().numpy(),
@@ -154,7 +154,7 @@ def predict(device: str):
 
   simulator.to(device)
   simulator.eval()
-  torch.compile(simulator)
+  # simulator = torch.compile(simulator)
 
   # Output path
   if not os.path.exists(FLAGS.output_path):
@@ -250,13 +250,13 @@ def train(rank, flags, world_size, device):
 
   # Read metadata
   metadata = reading_utils.read_metadata(flags["data_path"], "train")
-  print(f"Using amp: {flags['use_amp']}")
+  print(f"Using amp: {FLAGS.use_amp}",flush=True)
 
   con_radius = FLAGS.con_radius
   if con_radius is not None:
     metadata["default_connectivity_radius"] = con_radius
   # Get simulator and optimizer
-  scaler = GradScaler(enabled = flags["use_amp"]) #Grad scaler to prevent gradient vanishing with amp
+  scaler = GradScaler(enabled = FLAGS.use_amp) #Grad scaler to prevent gradient vanishing with amp
   if device == torch.device("cuda"):
     serial_simulator = _get_simulator(metadata, flags["noise_std"], flags["noise_std"], rank)
     simulator = DDP(serial_simulator.to(rank), device_ids=[rank], output_device=rank)
@@ -304,10 +304,9 @@ def train(rank, flags, world_size, device):
     else:
       msg = f'Specified model_file {flags["model_path"] + flags["model_file"]} and train_state_file {flags["model_path"] + flags["train_state_file"]} not found.'
       raise FileNotFoundError(msg)
-
   simulator.train()
   simulator.to(device_id)
-  torch.compile(simulator, mode = "max-autotune")
+  # simulator = torch.compile(simulator, mode = "max-autotune")
 
   if device == torch.device("cuda"):
     dl = distribute.get_data_distributed_dataloader_by_samples(path=f'{flags["data_path"]}train.npz',
@@ -350,7 +349,7 @@ def train(rank, flags, world_size, device):
 
         # Get the predictions and target accelerations.
         if device == torch.device("cuda"):
-          with autocast(dtype = torch.float16, enabled = flags["use_amp"]):
+          with autocast(dtype = torch.float16, enabled = FLAGS.use_amp):
             pred_acc, target_acc = simulator.module.predict_accelerations(
               next_positions=labels.to(rank),
               position_sequence_noise=sampled_noise.to(rank),
