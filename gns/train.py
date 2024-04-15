@@ -22,7 +22,7 @@ from gns import data_loader
 from gns import distribute
 import time
 
-from torch.cuda.amp import GradScaler
+from torch.cuda.amp import GradScaler, autocast
 
 flags.DEFINE_enum(
     'mode', 'train', ['train', 'valid', 'rollout'],
@@ -84,7 +84,7 @@ def rollout(
   ground_truth_positions = position[:, INPUT_SEQUENCE_LENGTH:]
 
   current_positions = initial_positions
-  predictions = []
+  predictions = torch.zeros(size = (nsteps, current_positions.shape[0], current_positions.shape[2]), device=device)
   print(f"Using amp: {FLAGS.use_amp}", flush=True)
   # with autocast(dtype = torch.float16, enabled = FLAGS.use_amp):
   start = time.time()
@@ -103,21 +103,20 @@ def rollout(
     kinematic_mask = kinematic_mask.bool()[:, None].expand(-1, current_positions.shape[-1])
     next_position = torch.where(
         kinematic_mask, next_position_ground_truth, next_position)
-    predictions.append(next_position)
+    predictions[step] = next_position
 
     # Shift `current_positions`, removing the oldest position in the sequence
     # and appending the next position at the end.
     current_positions = torch.cat(
         [current_positions[:, 1:], next_position[:, None, :]], dim=1)
 
-    end = time.time()
-    print(f"Time taken for rollout: {end - start}")
-    print(f"Num of edges: {simulator._num_edges}")
-    # Predictions with shape (time, nnodes, dim)
-    predictions = torch.stack(predictions)
-    ground_truth_positions = ground_truth_positions.permute(1, 0, 2)
+  end = time.time()
+  print(f"Time taken for rollout: {end - start}")
+  print(f"Num of edges: {simulator._num_edges}")
+  # Predictions with shape (time, nnodes, dim)
+  ground_truth_positions = ground_truth_positions.permute(1, 0, 2)
 
-    loss = (predictions - ground_truth_positions) ** 2
+  loss = (predictions - ground_truth_positions) ** 2
 
   output_dict = {
       'initial_positions': initial_positions.permute(1, 0, 2).cpu().numpy(),
