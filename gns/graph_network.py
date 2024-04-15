@@ -2,6 +2,8 @@ from typing import List
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
+from torch.cuda.amp import GradScaler, autocast
+
 
 
 def build_mlp(
@@ -343,6 +345,7 @@ class EncodeProcessDecode(nn.Module):
       nmessage_passing_steps: int,
       nmlp_layers: int,
       mlp_hidden_dim: int,
+      use_amp: bool,
   ):
     """Encode-Process-Decode function approximator for learnable simulator.
 
@@ -384,6 +387,7 @@ class EncodeProcessDecode(nn.Module):
         nmlp_layers=nmlp_layers,
         mlp_hidden_dim=mlp_hidden_dim,
     )
+    self._use_amp = use_amp
 
   def forward(self,
               x: torch.tensor,
@@ -403,7 +407,8 @@ class EncodeProcessDecode(nn.Module):
         x: Particle state representation as a torch tensor with shape
           (nparticles, nnode_out_features)
     """
-    x, edge_features = self._encoder(x, edge_features)
-    x, edge_features = self._processor(x, edge_index, edge_features)
-    x = self._decoder(x)
+    with autocast(dtype = torch.float16, enabled = self._use_amp):
+      x, edge_features = self._encoder(x, edge_features)
+      x, edge_features = self._processor(x, edge_index, edge_features)
+      x = self._decoder(x)
     return x

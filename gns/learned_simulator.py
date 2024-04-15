@@ -24,7 +24,8 @@ class LearnedSimulator(nn.Module):
           nparticle_types: int,
           particle_type_embedding_size: int,
           boundary_clamp_limit: float = 1.0,
-          device="cpu"
+          device="cpu",
+          use_amp=False
   ):
     """Initializes the model.
 
@@ -56,6 +57,7 @@ class LearnedSimulator(nn.Module):
     self._nparticle_types = nparticle_types
     self._boundary_clamp_limit = boundary_clamp_limit
     self._num_edges = 0
+    self._use_amp = use_amp
 
     # Particle type embedding has shape (9, 16)
     self._particle_type_embedding = nn.Embedding(
@@ -69,7 +71,8 @@ class LearnedSimulator(nn.Module):
         latent_dim=latent_dim,
         nmessage_passing_steps=nmessage_passing_steps,
         nmlp_layers=nmlp_layers,
-        mlp_hidden_dim=mlp_hidden_dim)
+        mlp_hidden_dim=mlp_hidden_dim,
+        use_amp=self._use_amp)
 
     self._device = device
 
