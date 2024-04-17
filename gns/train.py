@@ -6,6 +6,8 @@ import glob
 import re
 import sys
 
+import wandb
+
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -251,6 +253,24 @@ def train(rank, flags, world_size, device):
   metadata = reading_utils.read_metadata(flags["data_path"], "train")
   print(f"Using amp: {FLAGS.use_amp}",flush=True)
 
+  wandb.init(
+    project="GNS",
+    config={
+      "lr_init": FLAGS.lr_init,
+      "lr_decay": FLAGS.lr_decay,
+      "con_radius": FLAGS.con_radius,
+      "batch_size": FLAGS.batch_size,
+      "data_path": FLAGS.data_path,
+      "model_path": FLAGS.model_path,
+      "num_gpu": FLAGS.n_gpus,
+      "vel_mean": metadata['vel_mean'],
+      "vel_std": metadata['vel_std'],
+      "acc_mean": metadata['acc_mean'],
+      "acc_std": metadata['acc_std'],
+      "ntraining_steps": FLAGS.ntraining_steps
+    }
+  )
+
   con_radius = FLAGS.con_radius
   if con_radius is not None:
     metadata["default_connectivity_radius"] = con_radius
@@ -397,7 +417,13 @@ def train(rank, flags, world_size, device):
           param['lr'] = lr_new
 
         if rank == 0 or device == torch.device("cpu"):
-          print(f'Training step: {step}/{flags["ntraining_steps"]}. Loss: {loss}.')
+          print(f'Training step: {step}/{flags["ntraining_steps"]}. Loss: {loss}.', flush=True)
+          wandb.log(
+            {"Training Step": step,
+             "Loss": loss,
+             "Predicted Accuracy": pred_acc,
+             "Target Accuracy": target_acc
+            })
           # Save model state
           if step % flags["nsave_steps"] == 0:
             if device == torch.device("cpu"):
@@ -473,7 +499,7 @@ def _get_simulator(
     nnode_in = 37 if metadata['dim'] == 3 else 30
     nedge_in = metadata['dim'] + 1
   conn = metadata["default_connectivity_radius"]
-  print(f"connectivity radius is set to: {conn}")
+  print(f"Connectivity radius is set to: {conn}")
   # Init simulator.
   simulator = learned_simulator.LearnedSimulator(
       particle_dimensions=metadata['dim'],
@@ -501,6 +527,7 @@ def main(_):
   """Train or evaluates the model.
 
   """
+
   device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
   if device == torch.device('cuda'):
     os.environ["MASTER_ADDR"] = "localhost"
