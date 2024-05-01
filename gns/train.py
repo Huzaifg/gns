@@ -18,6 +18,7 @@ from absl import app
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from gns import learned_simulator
+from gns.Dtype import DType
 from gns import noise_utils
 from gns import reading_utils
 from gns import data_loader
@@ -38,7 +39,10 @@ flags.DEFINE_string('output_filename', 'rollout', help='Base name for saving the
 flags.DEFINE_string('model_file', None, help=('Model filename (.pt) to resume from. Can also use "latest" to default to newest file.'))
 flags.DEFINE_string('train_state_file', 'train_state.pt', help=('Train state filename (.pt) to resume from. Can also use "latest" to default to newest file.'))
 
-flags.DEFINE_boolean('use_amp', bool(0), 'Use Automatic Mixed Precision for training')
+
+flags.DEFINE_string('data_type', 'single', 'Data type to use - Options are "single", "mixed", or "half"')
+flags.register_validator('data_type', lambda value: value in ['single', 'mixed', 'half'], message='Invalid data type. Options are "single", "mixed", or "half"')
+
 
 flags.DEFINE_integer('ntraining_steps', int(2E7), help='Number of training steps.')
 flags.DEFINE_integer('nsave_steps', int(5000), help='Number of steps at which to save the model.')
@@ -81,14 +85,20 @@ def rollout(
     nsteps: Number of steps.
     device: torch device.
   """
+  if FLAGS.data_type == 'half':
+    dtype = torch.float16
+  else:
+    dtype = torch.float32
 
   initial_positions = position[:, :INPUT_SEQUENCE_LENGTH]
   ground_truth_positions = position[:, INPUT_SEQUENCE_LENGTH:]
+  if(nsteps != ground_truth_positions.shape[1]):
+    nsteps = ground_truth_positions.shape[1]
 
   current_positions = initial_positions
-  predictions = torch.zeros(size = (nsteps, current_positions.shape[0], current_positions.shape[2]), device=device)
-  print(f"Using amp: {FLAGS.use_amp}", flush=True)
-  # with autocast(dtype = torch.float16, enabled = FLAGS.use_amp):
+  predictions = torch.zeros(size = (nsteps, current_positions.shape[0], current_positions.shape[2]), device=device, dtype=dtype)
+  print(f"Using datatype: {dtype}", flush=True)
+  print(f"steps: {nsteps}")
   start = time.time()
 
   for step in tqdm(range(nsteps), total=nsteps):
@@ -115,6 +125,13 @@ def rollout(
   end = time.time()
   print(f"Time taken for rollout: {end - start}")
   print(f"Num of edges: {simulator._num_edges}")
+  # print(f"Average pre processing time: {simulator._pre_time / nsteps}")
+  # print(f"Average processing time: {simulator._process_time / nsteps}")
+  # print(f"Average post processing time: {simulator._decode_time / nsteps}")
+  # print(f"Average kinematic mask time: {kinematic_mask_time / nsteps}")
+  # print(f"Average graph time: {simulator._graph_compute_time / nsteps}")
+  # print(f"Number of time steps graph computed {simulator._counter}")
+
   # Predictions with shape (time, nnodes, dim)
   ground_truth_positions = ground_truth_positions.permute(1, 0, 2)
 
@@ -127,7 +144,7 @@ def rollout(
       'particle_types': particle_types.cpu().numpy(),
       'material_property': material_property.cpu().numpy() if material_property is not None else None
   }
-
+  simulator.reset_graph_state() # This has to be called if more than 1 example is processed
   return output_dict, loss
 
 
@@ -140,19 +157,28 @@ def predict(device: str):
   """
   if not FLAGS.is_parsed():
     FLAGS(sys.argv, known_only=True)
+
+  if FLAGS.data_type == 'half':
+    passing_dtype = DType.HALF
+  elif FLAGS.data_type == 'mixed':
+    passing_dtype = DType.MIXED
+  else:
+    passing_dtype = DType.SINGLE
+    
   # Read metadata
   metadata = reading_utils.read_metadata(FLAGS.data_path, "rollout")
   if FLAGS.con_radius is not None:
     con_radius = FLAGS.con_radius
     metadata["default_connectivity_radius"] = FLAGS.con_radius
-  simulator = _get_simulator(metadata, FLAGS.noise_std, FLAGS.noise_std, device, use_amp=FLAGS.use_amp)
+  simulator = _get_simulator(metadata, FLAGS.noise_std, FLAGS.noise_std, device, data_type=passing_dtype, lazy_graph_update=True, graph_update_interval=1)
 
   # Load simulator
   if os.path.exists(FLAGS.model_path + FLAGS.model_file):
     simulator.load(FLAGS.model_path + FLAGS.model_file)
   else:
     raise Exception(f"Model does not exist at {FLAGS.model_path + FLAGS.model_file}")
-
+  if(passing_dtype == DType.HALF):
+    simulator.half()
   simulator.to(device)
   simulator.eval()
   # simulator = torch.compile(simulator)
@@ -165,7 +191,7 @@ def predict(device: str):
   split = 'test' if FLAGS.mode == 'rollout' else 'valid'
 
   # Get dataset
-  ds = data_loader.get_data_loader_by_trajectories(path=f"{FLAGS.data_path}{split}.npz")
+  ds = data_loader.get_data_loader_by_trajectories(path=f"{FLAGS.data_path}{split}.npz", data_type=passing_dtype)
   # See if our dataset has material property as feature
   if len(ds.dataset._data[0]) == 3:  # `ds` has (positions, particle_type, material_property)
     material_property_as_feature = True
@@ -177,6 +203,8 @@ def predict(device: str):
   eval_loss = []
   with torch.no_grad():
     for example_i, features in enumerate(ds):
+      # if(example_i > 5):
+      #   break
       positions = features[0].to(device)
       print(f"Number of particles: {positions.shape[0]}")
       if metadata['sequence_length'] is not None:
@@ -243,6 +271,12 @@ def train(rank, flags, world_size, device):
   """
   if not FLAGS.is_parsed():
     FLAGS(sys.argv, known_only=True)
+  if FLAGS.data_type == 'half':
+    passing_dtype = DType.HALF
+  elif FLAGS.data_type == 'mixed':
+    passing_dtype = DType.MIXED
+  else:
+    passing_dtype = DType.SINGLE
   if device == torch.device("cuda"):
     distribute.setup(rank, world_size, device)
     device_id = rank
@@ -251,7 +285,7 @@ def train(rank, flags, world_size, device):
 
   # Read metadata
   metadata = reading_utils.read_metadata(flags["data_path"], "train")
-  print(f"Using amp: {FLAGS.use_amp}",flush=True)
+  print(f"Using Precision: {FLAGS.data_type}",flush=True)
 
   wandb.init(
     project="GNS",
@@ -270,18 +304,20 @@ def train(rank, flags, world_size, device):
       "ntraining_steps": FLAGS.ntraining_steps
     }
   )
-
+  do_autocast = False
   con_radius = FLAGS.con_radius
   if con_radius is not None:
     metadata["default_connectivity_radius"] = con_radius
+  if(passing_dtype == DType.MIXED):
+    do_autocast = True
   # Get simulator and optimizer
-  scaler = GradScaler(enabled = FLAGS.use_amp) #Grad scaler to prevent gradient vanishing with amp
+  scaler = GradScaler(enabled = do_autocast) #Grad scaler to prevent gradient vanishing with amp
   if device == torch.device("cuda"):
-    serial_simulator = _get_simulator(metadata, flags["noise_std"], flags["noise_std"], rank, use_amp=FLAGS.use_amp)
+    serial_simulator = _get_simulator(metadata, flags["noise_std"], flags["noise_std"], rank, data_type=passing_dtype)
     simulator = DDP(serial_simulator.to(rank), device_ids=[rank], output_device=rank)
     optimizer = torch.optim.Adam(simulator.parameters(), lr=flags["lr_init"]*world_size)
   else:
-    simulator = _get_simulator(metadata, flags["noise_std"], flags["noise_std"], device, use_amp=FLAGS.use_amp)
+    simulator = _get_simulator(metadata, flags["noise_std"], flags["noise_std"], device, data_type=passing_dtype)
     optimizer = torch.optim.Adam(simulator.parameters(), lr=flags["lr_init"] * world_size)
   step = 0
 
@@ -368,22 +404,22 @@ def train(rank, flags, world_size, device):
 
         # Get the predictions and target accelerations.
         if device == torch.device("cuda"):
-          # with autocast(dtype = torch.float16, enabled = FLAGS.use_amp):
-          pred_acc, target_acc = simulator.module.predict_accelerations(
-            next_positions=labels.to(rank),
-            position_sequence_noise=sampled_noise.to(rank),
-            position_sequence=position.to(rank),
-            nparticles_per_example=n_particles_per_example.to(rank),
-            particle_types=particle_type.to(rank),
-            material_property=material_property.to(rank) if n_features == 3 else None
-          )
-          # Calculate the loss and mask out loss on kinematic particles
-          loss = (pred_acc - target_acc) ** 2
-          loss = loss.sum(dim=-1)
-          num_non_kinematic = non_kinematic_mask.sum()
-          loss = torch.where(non_kinematic_mask.bool(),
-                        loss, torch.zeros_like(loss))
-          loss = loss.sum() / num_non_kinematic
+          with autocast(dtype = torch.float16, enabled = do_autocast):
+            pred_acc, target_acc = simulator.module.predict_accelerations(
+              next_positions=labels.to(rank),
+              position_sequence_noise=sampled_noise.to(rank),
+              position_sequence=position.to(rank),
+              nparticles_per_example=n_particles_per_example.to(rank),
+              particle_types=particle_type.to(rank),
+              material_property=material_property.to(rank) if n_features == 3 else None
+            )
+            # Calculate the loss and mask out loss on kinematic particles
+            loss = (pred_acc - target_acc) ** 2
+            loss = loss.sum(dim=-1)
+            num_non_kinematic = non_kinematic_mask.sum()
+            loss = torch.where(non_kinematic_mask.bool(),
+                          loss, torch.zeros_like(loss))
+            loss = loss.sum() / num_non_kinematic
 
         else:
           pred_acc, target_acc = simulator.predict_accelerations(
@@ -465,7 +501,9 @@ def _get_simulator(
         acc_noise_std: float,
         vel_noise_std: float,
         device: torch.device,
-        use_amp: bool = False) -> learned_simulator.LearnedSimulator:
+        data_type: DType = DType.SINGLE,
+        lazy_graph_update: bool = False, 
+        graph_update_interval: int = 2) -> learned_simulator.LearnedSimulator:
   """Instantiates the simulator.
 
   Args:
@@ -473,6 +511,8 @@ def _get_simulator(
     acc_noise_std: Acceleration noise std deviation.
     vel_noise_std: Velocity noise std deviation.
     device: PyTorch device 'cpu' or 'cuda'.
+    data_type: Datatype to use for computation, default is single precision. Options are single, mixed (amp) or half.
+    inference: If True, the simulator is used for inference.
   """
 
   # Normalization stats
@@ -516,7 +556,9 @@ def _get_simulator(
       particle_type_embedding_size=16,
       boundary_clamp_limit=metadata["boundary_augment"] if "boundary_augment" in metadata else 1.0,
       device=device,
-      use_amp=use_amp)
+      data_type=data_type,
+      lazy_graph_update=lazy_graph_update,
+      graph_update_interval=graph_update_interval)
 
   num_params = sum(p.numel() for p in simulator.parameters() if p.requires_grad)
   print(f"Number of Parameters {num_params}")

@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-
+from gns.Dtype import DType
 
 def load_npz_data(path):
     """Load data stored in npz format.
@@ -40,9 +40,10 @@ class SamplesDataset(torch.utils.data.Dataset):
         _data_lengths (list): List of lengths of trajectories in the dataset.
         _length (int): Total number of samples in the dataset.
         _precompute_cumlengths (np.array): Precomputed cumulative lengths of trajectories in the dataset.
+        _data_type(bool): Data type to convert all the data to.
     """
 
-    def __init__(self, path, input_length_sequence):
+    def __init__(self, path, input_length_sequence, data_type: DType = DType.SINGLE):
         super().__init__()
         # load dataset stored in npz format
         # data is loaded as dict of tuples
@@ -50,6 +51,9 @@ class SamplesDataset(torch.utils.data.Dataset):
         # convert to list of tuples
         # TODO: allow_pickle=True is potential security risk. See docs.
         self._data = load_npz_data(path)
+
+        #drop the last element of self._data -> This is a hack only for DEM sims
+        self._data = self._data[:-1]
         
         # length of each trajectory in the dataset
         # excluding the input_length_sequence
@@ -67,6 +71,11 @@ class SamplesDataset(torch.utils.data.Dataset):
         # to allow fast indexing in __getitem__
         self._precompute_cumlengths = [sum(self._data_lengths[:x]) for x in range(1, len(self._data_lengths) + 1)]
         self._precompute_cumlengths = np.array(self._precompute_cumlengths, dtype=int)
+        if(data_type == DType.HALF):
+            self._dtype = torch.float16
+        else:
+            self._dtype = torch.float32
+
 
     def __len__(self):
         """Return length of dataset.
@@ -171,7 +180,7 @@ class TrajectoriesDataset(torch.utils.data.Dataset):
     positions is a numpy array of shape (sequence_length, n_particles, dimension).
     """
 
-    def __init__(self, path):
+    def __init__(self, path, data_type: DType = DType.SINGLE):
         super().__init__()
         # load dataset stored in npz format
         # data is loaded as dict of tuples
@@ -182,8 +191,11 @@ class TrajectoriesDataset(torch.utils.data.Dataset):
         self._dimension = self._data[0][0].shape[-1]
         self._length = len(self._data)
         self._material_property_as_feature = True if len(self._data[0]) >= 3 else False
-
-    def __len__(self):
+        if(data_type == DType.HALF):
+            self._dtype = torch.float16
+        else:
+            self._dtype = torch.float32
+    def __len__(self):  
         """Return length of dataset.
 
         Returns:
@@ -209,9 +221,9 @@ class TrajectoriesDataset(torch.utils.data.Dataset):
             n_particles_per_example = positions.shape[0]
 
             trajectory = (
-                torch.tensor(positions).to(torch.float32).contiguous(),
+                torch.tensor(positions).to(dtype=self._dtype).contiguous(),
                 torch.tensor(particle_type).contiguous(),
-                torch.tensor(material_property).to(torch.float32).contiguous(),
+                torch.tensor(material_property).to(dtype=self._dtype).contiguous(),
                 n_particles_per_example
             )
         else:
@@ -221,11 +233,10 @@ class TrajectoriesDataset(torch.utils.data.Dataset):
             n_particles_per_example = positions.shape[0]
 
             trajectory = (
-                torch.tensor(positions).to(torch.float32).contiguous(),
+                torch.tensor(positions).to(dtype=self._dtype).contiguous(),
                 torch.tensor(particle_type).contiguous(),
                 n_particles_per_example
             )
-
         return trajectory
 
 
@@ -246,7 +257,7 @@ def get_data_loader_by_samples(path, input_length_sequence, batch_size, shuffle=
                                        pin_memory=True, collate_fn=collate_fn)
 
 
-def get_data_loader_by_trajectories(path):
+def get_data_loader_by_trajectories(path, data_type: DType = DType.SINGLE):
     """Returns a data loader for the dataset.
 
     Args:
@@ -255,6 +266,6 @@ def get_data_loader_by_trajectories(path):
     Returns:
         torch.utils.data.DataLoader: Data loader for the dataset.
     """
-    dataset = TrajectoriesDataset(path)
+    dataset = TrajectoriesDataset(path, data_type=data_type)
     return torch.utils.data.DataLoader(dataset, batch_size=None, shuffle=False,
                                        pin_memory=True)

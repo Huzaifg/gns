@@ -345,7 +345,7 @@ class EncodeProcessDecode(nn.Module):
       nmessage_passing_steps: int,
       nmlp_layers: int,
       mlp_hidden_dim: int,
-      use_amp: bool,
+      use_amp: bool
   ):
     """Encode-Process-Decode function approximator for learnable simulator.
 
@@ -407,6 +407,10 @@ class EncodeProcessDecode(nn.Module):
         x: Particle state representation as a torch tensor with shape
           (nparticles, nnode_out_features)
     """
+    # When dtype half is enabled, everything runs in half
+    # When dtype mixed is enabled, we let AMP handle the casting
+    # When dtype float32 is enabled, everything runs in float32 as
+    # self._use_amp is False
     with autocast(dtype = torch.float16, enabled = self._use_amp):
       x, edge_features = self._encoder(x, edge_features)
       x, edge_features = self._processor(x, edge_index, edge_features)
