@@ -5,11 +5,12 @@ import pickle
 import glob
 import re
 import sys
-
+import wandb
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 import hydra
@@ -22,6 +23,7 @@ from gns import reading_utils
 from gns import particle_data_loader as pdl
 from gns import distribute
 from gns.args import Config
+from gns.Dtype import DType
 
 Stats = collections.namedtuple("Stats", ["mean", "std"])
 
@@ -49,11 +51,22 @@ def rollout(
       device: torch device.
     """
 
+    if cfg.rollout.dtype_mode == 'half':
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+
     initial_positions = position[:, : cfg.data.input_sequence_length]
     ground_truth_positions = position[:, cfg.data.input_sequence_length :]
 
+    # This might need to be removed, do not remeber why I added it
+    if(nsteps != ground_truth_positions.shape[1]):
+        nsteps = ground_truth_positions.shape[1]
+
     current_positions = initial_positions
-    predictions = []
+    predictions = torch.zeros(size = (nsteps, current_positions.shape[0], current_positions.shape[2]), device=device, dtype=dtype)
+    print(f"Using datatype: {dtype}", flush=True)
+    print(f"steps: {nsteps}")
 
     for step in tqdm(range(nsteps), total=nsteps):
         # Get next position with shape (nnodes, dim)
@@ -78,7 +91,7 @@ def rollout(
         next_position = torch.where(
             kinematic_mask, next_position_ground_truth, next_position
         )
-        predictions.append(next_position)
+        predictions[step] = next_position
 
         # Shift `current_positions`, removing the oldest position in the sequence
         # and appending the next position at the end.
@@ -101,7 +114,7 @@ def rollout(
             material_property.cpu().numpy() if material_property is not None else None
         ),
     }
-
+    simulator.reset_graph_state() # This has to be called if more than 1 rollout example is processed (which could very well happen)
     return output_dict, loss
 
 
@@ -113,6 +126,15 @@ def predict(device: str, cfg: DictConfig):
       cfg: configuration dictionary.
 
     """
+    if cfg.rollout.dtype_mode == 'half':
+        dtype = DType.HALF
+    elif cfg.rollout.dtype_mode == 'single':
+        dtype = DType.SINGLE
+    else:
+        raise ValueError("Wrong input: Mixed precision inference does not make any sense")
+
+    if cfg.rollout.graph_build_freq > 1:
+        lazy_graph_update = True
     # Read metadata
     metadata = reading_utils.read_metadata(cfg.data.path, "rollout")
     simulator = _get_simulator(
@@ -121,6 +143,9 @@ def predict(device: str, cfg: DictConfig):
         cfg.data.noise_std,
         cfg.data.noise_std,
         device,
+        dtype = dtype,
+        lazy_graph_update = lazy_graph_update,
+        graph_build_freq = cfg.rollout.graph_build_freq
     )
 
     # Load simulator
@@ -129,6 +154,8 @@ def predict(device: str, cfg: DictConfig):
     else:
         raise Exception(f"Model does not exist at {cfg.model.path + cfg.model.file}")
 
+    if dtype == DType.HALF:
+        simulator.half()
     simulator.to(device)
     simulator.eval()
 
@@ -144,7 +171,7 @@ def predict(device: str, cfg: DictConfig):
     )
 
     # Get dataset
-    ds = pdl.get_data_loader(file_path=f"{cfg.data.path}{split}.npz", mode="trajectory")
+    ds = pdl.get_data_loader(file_path=f"{cfg.data.path}{split}.npz", mode="trajectory", dtype=dtype)
     # See if our dataset has material property as feature
     test_dataset = pdl.ParticleDataset(f"{cfg.data.path}{split}.npz")
     n_features = test_dataset.get_num_features()
@@ -289,7 +316,7 @@ def save_model_and_train_state(
         torch.save(train_state, f"{cfg.model.path}train_state-{step}.pt")
 
 
-def setup_simulator_and_optimizer(cfg, metadata, rank, world_size, device, use_dist):
+def setup_simulator_and_optimizer(cfg, metadata, rank, world_size, device, use_dist, dtype=torch.float32):
     """Setup simulator and optimizer.
 
     Args:
@@ -306,6 +333,7 @@ def setup_simulator_and_optimizer(cfg, metadata, rank, world_size, device, use_d
             cfg.data.noise_std,
             cfg.data.noise_std,
             rank,
+            dtype=dtype
         )
         if use_dist:
             simulator = DDP(serial_simulator.to("cuda"), device_ids=[rank])
@@ -321,6 +349,7 @@ def setup_simulator_and_optimizer(cfg, metadata, rank, world_size, device, use_d
             cfg.data.noise_std,
             cfg.data.noise_std,
             device,
+            dtype=float
         )
         optimizer = torch.optim.Adam(
             simulator.parameters(), lr=cfg.training.learning_rate.initial * world_size
@@ -328,7 +357,7 @@ def setup_simulator_and_optimizer(cfg, metadata, rank, world_size, device, use_d
     return simulator, optimizer
 
 
-def initialize_training(cfg, rank, world_size, device, use_dist):
+def initialize_training(cfg, rank, world_size, device, use_dist, dtype=torch.float32):
     """Initialize training.
 
     Args:
@@ -340,7 +369,7 @@ def initialize_training(cfg, rank, world_size, device, use_dist):
     """
     metadata = reading_utils.read_metadata(cfg.data.path, "train")
     simulator, optimizer = setup_simulator_and_optimizer(
-        cfg, metadata, rank, world_size, device, use_dist
+        cfg, metadata, rank, world_size, device, use_dist, dtype=dtype
     )
     return simulator, optimizer, metadata
 
@@ -376,32 +405,40 @@ def load_datasets(cfg, use_dist):
     return train_dl, valid_dl, n_features
 
 
-def setup_tensorboard(cfg, metadata):
-    """Setup tensorboard.
+def setup_wandb(cfg, metadata):
+    """Setup wandb logging.
 
     Args:
         cfg: Configuration dictionary.
         metadata: Metadata.
     """
-    writer = SummaryWriter(log_dir=cfg.logging.tensorboard_dir)
+    wandb.init(
+        project="GNS",
+        config={
+            "lr_init": cfg.training.learning_rate.initial,
+            "lr_decay": cfg.training.learning_rate.decay,
+            "lr_decay_steps": cfg.training.learning_rate.decay_steps,
+            "batch_size": cfg.data.batch_size,
+            "noise_std": cfg.data.noise_std,
+            "ntraining_steps": cfg.training.steps,
+            "dtype_mode": cfg.training.dtype_mode,
+        }
+    )
+    # TODO: Make sure to read this sweep config in the training portion and use it
+    config = wandb.config # Sweep config setup for later
 
-    writer.add_text("metadata", json.dumps(metadata, indent=4))
+    # Log metadata as text
+    metadata_json = json.dumps(metadata, indent=4)
+    wandb.log({"metadata": metadata_json})
+
+    # Log configuration as text
     yaml_config = OmegaConf.to_yaml(cfg)
-    writer.add_text("Config", yaml_config, global_step=0)
+    wandb.log({"Config": yaml_config})
 
-    # Log hyperparameters
-    hparam_dict = {
-        "lr_init": cfg.training.learning_rate.initial,
-        "lr_decay": cfg.training.learning_rate.decay,
-        "lr_decay_steps": cfg.training.learning_rate.decay_steps,
-        "batch_size": cfg.data.batch_size,
-        "noise_std": cfg.data.noise_std,
-        "ntraining_steps": cfg.training.steps,
-    }
-    metric_dict = {"train_loss": 0, "valid_loss": 0}  # Initial values
-    writer.add_hparams(hparam_dict, metric_dict)
-    return writer
-
+    # Log initial metrics
+    initial_metrics = {"train_loss": 0, "valid_loss": 0}
+    wandb.log(initial_metrics)
+    return config
 
 def prepare_data(example, device_id):
     """Prepare data for training or validation."""
@@ -433,12 +470,23 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
       verbose: global rank 0 or cpu
       use_dist: use torch.distribute
     """
+    if cfg.training.dtype_mode == 'half':
+        raise ValueError("Wrong input: Half precision training is not recommeneded")
+    elif cfg.training.dtype_mode == 'single':
+        dtype = DType.SINGLE
+    else:
+        dtype = DType.MIXED
+        do_autocast = True
+    
     device_id = rank if device == torch.device("cuda") else device
 
     # Initialize simulator and optimizer
     simulator, optimizer, metadata = initialize_training(
-        cfg, rank, world_size, device, use_dist
+        cfg, rank, world_size, device, use_dist, dtype=dtype
     )
+
+    # Get simulator and optimizer
+    scaler = GradScaler(enabled = do_autocast) #Grad scaler to prevent gradient vanishing with amp
 
     # Initialize training state
     step = 0
@@ -484,6 +532,8 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                 simulator.module.parameters() if use_dist else simulator.parameters()
             )
             optimizer.load_state_dict(train_state["optimizer_state"])
+            if "scaler" in train_state:
+                scaler.load_state_dict(train_state["scaler"])
             optimizer_to(optimizer, device_id)
 
             # set global train state
@@ -499,12 +549,12 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
     simulator.train()
     simulator.to(device_id)
 
-    # Load datasets
+    # Load datasets - Here no data type is passed because Automatic Mixed Precision will take care of it
     train_dl, valid_dl, n_features = load_datasets(cfg, use_dist)
 
     print(f"rank = {rank}, cuda = {torch.cuda.is_available()}")
 
-    writer = setup_tensorboard(cfg, metadata) if verbose else None
+    wandb_config = setup_wandb(cfg, metadata) if verbose else None
 
     try:
         num_epochs = max(1, (cfg.training.steps + len(train_dl) - 1) // len(train_dl))
@@ -560,47 +610,50 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                         if use_dist
                         else simulator.predict_accelerations
                     )
-                    pred_acc, target_acc = predict_fn(
-                        next_positions=labels.to(device_or_rank),
-                        position_sequence_noise=sampled_noise.to(device_or_rank),
-                        position_sequence=position.to(device_or_rank),
-                        nparticles_per_example=n_particles_per_example.to(
-                            device_or_rank
-                        ),
-                        particle_types=particle_type.to(device_or_rank),
-                        material_property=(
-                            material_property.to(device_or_rank)
-                            if n_features == 3
-                            else None
-                        ),
-                    )
+                    with autocast(dtype = torch.float16, enabled = do_autocast):
+                        pred_acc, target_acc = predict_fn(
+                            next_positions=labels.to(device_or_rank),
+                            position_sequence_noise=sampled_noise.to(device_or_rank),
+                            position_sequence=position.to(device_or_rank),
+                            nparticles_per_example=n_particles_per_example.to(
+                                device_or_rank
+                            ),
+                            particle_types=particle_type.to(device_or_rank),
+                            material_property=(
+                                material_property.to(device_or_rank)
+                                if n_features == 3
+                                else None
+                            ),
+                        )
 
-                    if (
-                        cfg.training.validation_interval is not None
-                        and step > 0
-                        and step % cfg.training.validation_interval == 0
-                    ):
-                        if verbose:
-                            sampled_valid_example = next(iter(valid_dl))
-                            valid_loss = validation(
-                                simulator,
-                                sampled_valid_example,
-                                n_features,
-                                cfg,
-                                rank,
-                                device_id,
-                            )
-                            writer.add_scalar("Loss/valid", valid_loss.item(), step)
+                        if (
+                            cfg.training.validation_interval is not None
+                            and step > 0
+                            and step % cfg.training.validation_interval == 0
+                        ):
+                            if verbose:
+                                sampled_valid_example = next(iter(valid_dl))
+                                valid_loss = validation(
+                                    simulator,
+                                    sampled_valid_example,
+                                    n_features,
+                                    cfg,
+                                    rank,
+                                    device_id,
+                                    do_autocast=do_autocast
+                                )
+                            wandb.log({"Loss/valid": valid_loss.item()}, step=step)
 
-                    loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
+                        loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
 
                     train_loss = loss.item()
                     epoch_loss += train_loss
                     steps_this_epoch += 1
 
                     optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+                    scaler.scale(loss).backward() # calculate scaled gradients
+                    scaler.step(optimizer)
+                    scaler.update()
 
                     lr_new = (
                         cfg.training.learning_rate.initial
@@ -615,8 +668,8 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
 
                     # Log training loss
                     if verbose:
-                        writer.add_scalar("Loss/train", train_loss, step)
-                        writer.add_scalar("Learning Rate", lr_new, step)
+                        wandb.log({"Loss/train": train_loss.item()}, step=step)
+                        wandb.log({"Learning Rate": lr_new}, step=step)
 
                     avg_loss = epoch_loss / steps_this_epoch
                     pbar.set_postfix(
@@ -659,7 +712,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
             if cfg.training.validation_interval is not None:
                 sampled_valid_example = next(iter(valid_dl))
                 epoch_valid_loss = validation(
-                    simulator, sampled_valid_example, n_features, cfg, rank, device_id
+                    simulator, sampled_valid_example, n_features, cfg, rank, device_id, do_autocast=do_autocast
                 )
                 if device == torch.device("cuda"):
                     torch.distributed.reduce(
@@ -669,11 +722,9 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                 valid_loss_hist.append((epoch, epoch_valid_loss.item()))
 
             if verbose:
-                writer.add_scalar("Loss/train_epoch", avg_loss.item(), epoch)
+                wandb.log({"Loss/train_epoch": avg_loss.item()}, step=epoch)
                 if cfg.training.validation_interval is not None:
-                    writer.add_scalar(
-                        "Loss/valid_epoch", epoch_valid_loss.item(), epoch
-                    )
+                    wandb.log({"Loss/valid_epoch": epoch_valid_loss.item()}, step=epoch)
 
             if step >= cfg.training.steps:
                 break
@@ -696,9 +747,6 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
         use_dist,
     )
 
-    if verbose:
-        writer.close()
-
     if use_dist:
         distribute.cleanup()
 
@@ -709,6 +757,9 @@ def _get_simulator(
     acc_noise_std: float,
     vel_noise_std: float,
     device: torch.device,
+    dtype: DType = DType.SINGLE,
+    lazy_graph_update: bool = False,
+    graph_build_freq: int = 1
 ) -> learned_simulator.LearnedSimulator:
     """Instantiates the simulator.
 
@@ -763,12 +814,15 @@ def _get_simulator(
             metadata["boundary_augment"] if "boundary_augment" in metadata else 1.0
         ),
         device=device,
+        dtype=dtype,
+        lazy_graph_update=lazy_graph_update,
+        graph_build_freq=graph_build_freq
     )
 
     return simulator
 
 
-def validation(simulator, example, n_features, cfg, rank, device_id):
+def validation(simulator, example, n_features, cfg, rank, device_id, do_autocast = False):
 
     position, particle_type, material_property, n_particles_per_example, labels = (
         prepare_data(example, device_id)
@@ -793,16 +847,17 @@ def validation(simulator, example, n_features, cfg, rank, device_id):
     )
     # Get the predictions and target accelerations
     with torch.no_grad():
-        pred_acc, target_acc = predict_accelerations(
-            next_positions=labels.to(device_or_rank),
-            position_sequence_noise=sampled_noise.to(device_or_rank),
-            position_sequence=position.to(device_or_rank),
-            nparticles_per_example=n_particles_per_example.to(device_or_rank),
-            particle_types=particle_type.to(device_or_rank),
-            material_property=(
-                material_property.to(device_or_rank) if n_features == 3 else None
-            ),
-        )
+        with autocast(dtype = torch.float16, enabled = do_autocast):
+            pred_acc, target_acc = predict_accelerations(
+                next_positions=labels.to(device_or_rank),
+                position_sequence_noise=sampled_noise.to(device_or_rank),
+                position_sequence=position.to(device_or_rank),
+                nparticles_per_example=n_particles_per_example.to(device_or_rank),
+                particle_types=particle_type.to(device_or_rank),
+                material_property=(
+                    material_property.to(device_or_rank) if n_features == 3 else None
+                ),
+            )
 
     # Compute loss
     loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)

@@ -2,6 +2,7 @@ from typing import List
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
+from torch.cuda.amp import GradScaler, autocast
 
 
 def build_mlp(
@@ -359,6 +360,7 @@ class EncodeProcessDecode(nn.Module):
         nmessage_passing_steps: int,
         nmlp_layers: int,
         mlp_hidden_dim: int,
+        use_amp: bool
     ):
         """Encode-Process-Decode function approximator for learnable simulator.
 
@@ -374,6 +376,7 @@ class EncodeProcessDecode(nn.Module):
           latent_dim: Size of latent dimension (128)
           nmlp_layer: Number of hidden layers in the MLP (typically of size 2).
           mlp_hidden_dim: Size of the hidden layer (latent dimension of size 128).
+          use_amp: Automatic mixed precision (AMP) flag.
 
         """
         super(EncodeProcessDecode, self).__init__()
@@ -400,6 +403,7 @@ class EncodeProcessDecode(nn.Module):
             nmlp_layers=nmlp_layers,
             mlp_hidden_dim=mlp_hidden_dim,
         )
+        self._use_amp = use_amp
 
     def forward(
         self, x: torch.tensor, edge_index: torch.tensor, edge_features: torch.tensor
@@ -418,7 +422,12 @@ class EncodeProcessDecode(nn.Module):
           x: Particle state representation as a torch tensor with shape
             (nparticles, nnode_out_features)
         """
-        x, edge_features = self._encoder(x, edge_features)
-        x, edge_features = self._processor(x, edge_index, edge_features)
-        x = self._decoder(x)
+        # When dtype half is enabled, everything runs in half
+        # When dtype mixed is enabled, we let AMP handle the casting
+        # When dtype float32 is enabled, everything runs in float32 as
+        # self._use_amp is False
+        with autocast(dtype = torch.float16, enabled = self._use_amp):
+          x, edge_features = self._encoder(x, edge_features)
+          x, edge_features = self._processor(x, edge_index, edge_features)
+          x = self._decoder(x)
         return x

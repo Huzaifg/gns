@@ -40,8 +40,13 @@ class TrainingConfig:
     validation_interval: Optional[int] = None
     save_steps: int = 500
     resume: Optional[bool] = False
+    dtype_mode: Optional[str] = "mixed"
     learning_rate: LearningRateConfig = field(default_factory=LearningRateConfig)
 
+@dataclass
+class RolloutConfig:
+    dtype_mode: str = "half"
+    graph_build_frequency: int = 1
 
 @dataclass
 class HardwareConfig:
@@ -60,6 +65,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    rollout: RolloutConfig = field(default_factory=RolloutConfig)
     hardware: HardwareConfig = field(default_factory=HardwareConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 

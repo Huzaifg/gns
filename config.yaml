@@ -37,10 +37,16 @@ training:
   validation_interval: null
   save_steps: 500
   resume: False
+  dtype_mode: mixed # Options: mixed (Automatic Mixed Precision), single (float32)
   learning_rate:
     initial: 1e-4
     decay: 0.1
     decay_steps: 50000
+
+# Some rollout specifications
+rollout:
+  dtype_mode: half # Options: single (float32), half (float16)
+  graph_build_frequency: 4 # Steps between graph rebuilds
 
 # Hardware configuration
 hardware:
@@ -48,4 +54,4 @@ hardware:
 
 # Logging configuration
 logging:
-  tensorboard_dir: logs/
+  wandb_dir: logs/

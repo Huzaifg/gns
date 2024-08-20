@@ -3,7 +3,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 import h5py
-
+from gns.Dtype import DType
 
 def load_data(path):
     """Load data stored in npz or h5 format."""
@@ -28,11 +28,15 @@ def load_data(path):
 
 
 class ParticleDataset(Dataset):
-    def __init__(self, file_path, input_sequence_length=6, mode="sample"):
+    def __init__(self, file_path, input_sequence_length=6, mode="sample", dtype = torch.float32):
         self.file_path = file_path
         self.input_sequence_length = input_sequence_length
         self.mode = mode
         self.data = load_data(file_path)
+        if(dtype == DType.HALF):
+            self.dtype = torch.float16
+        else:
+            self.dtype = torch.float32
         self._preprocess_data()
 
     def _preprocess_data(self):
@@ -75,7 +79,7 @@ class ParticleDataset(Dataset):
 
         if self.material_property_as_feature:
             material_property = np.full(
-                positions.shape[0], self.data[trajectory_idx][2], dtype=float
+                positions.shape[0], self.data[trajectory_idx][2], dtype=self.dtype
             )
             features = (
                 positions,
@@ -96,14 +100,14 @@ class ParticleDataset(Dataset):
             positions = np.transpose(positions, (1, 0, 2))
             particle_type = np.full(positions.shape[0], particle_type, dtype=int)
             material_property = np.full(
-                positions.shape[0], material_property, dtype=float
+                positions.shape[0], material_property, dtype=self.dtype
             )
             n_particles_per_example = positions.shape[0]
 
             trajectory = (
-                torch.tensor(positions).to(torch.float32).contiguous(),
+                torch.tensor(positions).to(self.dtype).contiguous(),
                 torch.tensor(particle_type).contiguous(),
-                torch.tensor(material_property).to(torch.float32).contiguous(),
+                torch.tensor(material_property).to(self.dtype).contiguous(),
                 n_particles_per_example,
             )
         else:
@@ -113,7 +117,7 @@ class ParticleDataset(Dataset):
             n_particles_per_example = positions.shape[0]
 
             trajectory = (
-                torch.tensor(positions).to(torch.float32).contiguous(),
+                torch.tensor(positions).to(self.dtype).contiguous(),
                 torch.tensor(particle_type).contiguous(),
                 n_particles_per_example,
             )
@@ -129,7 +133,7 @@ class ParticleDataset(Dataset):
         """
         return len(self.data[0])
 
-
+# TODO: Figure out how to get the variable datatype into this function
 def collate_fn_sample(batch):
     features, labels = zip(*batch)
 
@@ -179,6 +183,7 @@ def get_data_loader(
     batch_size=32,
     shuffle=True,
     use_dist=False,
+    dtype=torch.float32
 ):
     """
     Get a data loader for the ParticleDataset.
@@ -194,7 +199,7 @@ def get_data_loader(
     Returns:
         DataLoader: A PyTorch DataLoader object.
     """
-    dataset = ParticleDataset(file_path, input_sequence_length, mode)
+    dataset = ParticleDataset(file_path, input_sequence_length, mode, dtype)
 
     if use_dist:
         sampler = DistributedSampler(dataset, shuffle=shuffle)

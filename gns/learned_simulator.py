@@ -4,6 +4,7 @@ import numpy as np
 from gns import graph_network
 from torch_geometric.nn import radius_graph
 from typing import Dict
+from gns.Dtype import DType
 
 
 class LearnedSimulator(nn.Module):
@@ -25,6 +26,9 @@ class LearnedSimulator(nn.Module):
         particle_type_embedding_size: int,
         boundary_clamp_limit: float = 1.0,
         device="cpu",
+        dtype: DType = DType.SINGLE,
+        lazy_graph_update=False,
+        graph_build_freq=1
     ):
         """Initializes the model.
 
@@ -47,14 +51,42 @@ class LearnedSimulator(nn.Module):
           boundary_clamp_limit: a factor to enlarge connectivity radius used for computing
             normalized clipped distance in edge feature.
           device: Runtime device (cuda or cpu).
+          dtype: Data type for the model (single, half, mixed).
+          lazy_graph_update: Boolean flag to determine if we want lazy graph update (useful during inference)
+          graph_update_interval: Number of steps asfter which we want graph update (defaults to 1 if lazy_graph_update is False , defaults to 2 if lazy_graph_update is True)
 
         """
         super(LearnedSimulator, self).__init__()
-        self._boundaries = boundaries
+        if(dtype == DType.SINGLE):
+          self._dtype = torch.float32
+          self._use_amp = False
+        elif(dtype == DType.HALF):
+          self._dtype = torch.float16
+          self._use_amp = False
+        elif(dtype == DType.MIXED):
+          self._dtype = torch.float32
+          self._use_amp = True
+
+        self._lazy_graph_update = lazy_graph_update
+        if(self._lazy_graph_update):
+          self._graph_build_freq = graph_build_freq
+
+        
+        self._boundaries = torch.tensor(
+            boundaries, requires_grad=False).to(device, dtype=self._dtype)
+        self._lower_boundary = self._boundaries[:, 0][None]
+        self._upper_boundary = self._boundaries[:, 1][None]
         self._connectivity_radius = connectivity_radius
+        self._one_by_connectivity_radius = torch.tensor(1.0 / self._connectivity_radius, device=device, dtype=self._dtype)
         self._normalization_stats = normalization_stats
+        self._velocity_stats = normalization_stats["velocity"]
+        self._velocity_mean = self._velocity_stats["mean"]
+        self._velocity_std = self._velocity_stats["std"]
+        self._one_by_velocity_std = torch.tensor(1.0 / self._velocity_std, device=device, dtype=torch.float32)
+        self._acceleration_stats = normalization_stats["acceleration"]
         self._nparticle_types = nparticle_types
-        self._boundary_clamp_limit = boundary_clamp_limit
+        self._boundary_clamp_limit = torch.tensor(boundary_clamp_limit, device=device, dtype=torch.float16)
+        self._num_edges = 0
 
         # Particle type embedding has shape (9, 16)
         self._particle_type_embedding = nn.Embedding(
@@ -70,13 +102,24 @@ class LearnedSimulator(nn.Module):
             nmessage_passing_steps=nmessage_passing_steps,
             nmlp_layers=nmlp_layers,
             mlp_hidden_dim=mlp_hidden_dim,
+            use_amp=self._use_amp
         )
 
         self._device = device
 
+        self._conter = 0
+        self._old_senders = None
+        self._old_receivers = None
+        self._counter = 0
+
     def forward(self):
         """Forward hook runs on class instantiation"""
         pass
+    def reset_graph_state(self):
+      self._old_senders = None
+      self._old_receivers = None
+      self._relative_displacement_with_old_senders = None
+      self._counter = 0
 
     def _compute_graph_connectivity(
         self,
@@ -116,8 +159,91 @@ class LearnedSimulator(nn.Module):
         # "source_to_target"
         receivers = edge_index[0, :]
         senders = edge_index[1, :]
-
+        self._num_edges = senders.shape[0]
         return receivers, senders
+    def _encoder_preprocessor_lazy(
+              self,
+              position_sequence: torch.tensor,
+              nparticles_per_example: torch.tensor,
+              particle_types: torch.tensor,
+              material_property: torch.tensor = None):
+        """Extracts important features from the position sequence. Returns a tuple
+        of node_features (nparticles, 30), edge_index (nparticles, nparticles), and
+        edge_features (nparticles, 3).
+
+        Args:
+          position_sequence: A sequence of particle positions. Shape is
+            (nparticles, 6, dim). Includes current + last 5 positions
+          nparticles_per_example: Number of particles per example. Default is 2
+            examples per batch.
+          particle_types: Particle types with shape (nparticles).
+          material_property: Friction angle normalized by tan() with shape (nparticles)
+        """
+        nparticles = position_sequence.shape[0]
+        most_recent_position = position_sequence[:, -1]  # (n_nodes, 2)
+        velocity_sequence = position_sequence[:, 1:] - position_sequence[:, :-1]
+
+
+        # Get connectivity of the graph with shape of (nparticles, 2)
+        # Compute graph update lazily
+        if self._counter % self._graph_build_freq == 0:
+          edge_index = radius_graph(most_recent_position, r=self._connectivity_radius, loop=True, max_num_neighbors=128)
+          self._old_senders, self._old_receivers = edge_index[1,:], edge_index[0,:]
+        self._num_edges = self._old_senders.shape[0]
+        node_features = []
+
+        # Normalized velocity sequence, merging spatial an time axis.
+        normalized_velocity_sequence = (
+            velocity_sequence - self._velocity_mean) * self._one_by_velocity_std
+        flat_velocity_sequence = normalized_velocity_sequence.view(
+            nparticles, -1)
+        # There are 5 previous steps, with dim 2
+        # node_features shape (nparticles, 5 * 2 = 10)
+        node_features.append(flat_velocity_sequence.to(dtype=self._dtype))
+
+        # Normalized clipped distances to lower and upper boundaries.
+        # boundaries are an array of shape [num_dimensions, 2], where the second
+        # axis, provides the lower/upper boundaries.
+        
+        
+        distance_to_lower_boundary = (
+            most_recent_position - self._lower_boundary)
+        distance_to_upper_boundary = (
+            self._upper_boundary - most_recent_position)
+        distance_to_boundaries = torch.cat(
+            [distance_to_lower_boundary, distance_to_upper_boundary], dim=1)
+        normalized_clipped_distance_to_boundaries = torch.clamp(
+            distance_to_boundaries * self._one_by_connectivity_radius,
+            -self._boundary_clamp_limit, self._boundary_clamp_limit)
+        # The distance to 4 boundaries (top/bottom/left/right)
+        # node_features shape (nparticles, 10+4)
+        node_features.append(normalized_clipped_distance_to_boundaries.to(dtype=self._dtype))
+
+        
+        # Particle type
+        if self._nparticle_types > 1:
+          particle_type_embeddings = self._particle_type_embedding(
+              particle_types)
+          node_features.append(particle_type_embeddings)
+        # Final node_features shape (nparticles, 30) for 2D (if material_property is not valid in training example)
+        # 30 = 10 (5 velocity sequences*dim) + 4 boundaries + 16 particle embedding
+
+        # Material property
+        if material_property is not None:
+            material_property = material_property.view(nparticles, 1)
+            node_features.append(material_property.to(dtype=self._dtype))
+
+        # Final node_features shape (nparticles, 31) for 2D
+        # 31 = 10 (5 velocity sequences*dim) + 4 boundaries + 16 particle embedding + 1 material property
+        
+
+        edge_features = _get_edge_features(self._old_senders, self._old_receivers, most_recent_position, self._one_by_connectivity_radius)
+        # to keep track of steps to know when to update graph
+        self._counter += 1
+
+        return (torch.cat(node_features, dim=-1),
+                torch.stack([self._old_senders, self._old_receivers]),
+                edge_features.to(dtype=self._dtype))
 
     def _encoder_preprocessor(
         self,
@@ -272,23 +398,27 @@ class LearnedSimulator(nn.Module):
         Returns:
           next_positions (torch.tensor): Next position of particles.
         """
-        if material_property is not None:
-            node_features, edge_index, edge_features = self._encoder_preprocessor(
-                current_positions,
-                nparticles_per_example,
-                particle_types,
-                material_property,
-            )
+        if self._lazy_graph_update:
+          if material_property is not None:
+              node_features, edge_index, edge_features = self._encoder_preprocessor_lazy(
+                  current_positions, nparticles_per_example, particle_types, material_property)
+          else:
+              node_features, edge_index, edge_features = self._encoder_preprocessor_lazy(
+                  current_positions, nparticles_per_example, particle_types)
         else:
-            node_features, edge_index, edge_features = self._encoder_preprocessor(
-                current_positions, nparticles_per_example, particle_types
-            )
+          if material_property is not None:
+              node_features, edge_index, edge_features = self._encoder_preprocessor(
+                  current_positions, nparticles_per_example, particle_types, material_property)
+          else:
+              node_features, edge_index, edge_features = self._encoder_preprocessor(
+                  current_positions, nparticles_per_example, particle_types)
+
         predicted_normalized_acceleration = self._encode_process_decode(
-            node_features, edge_index, edge_features
-        )
+            node_features, edge_index, edge_features)
+
         next_positions = self._decoder_postprocessor(
-            predicted_normalized_acceleration, current_positions
-        )
+            predicted_normalized_acceleration, current_positions)
+
         return next_positions
 
     def predict_accelerations(
@@ -324,27 +454,29 @@ class LearnedSimulator(nn.Module):
         noisy_position_sequence = position_sequence + position_sequence_noise
 
         # Perform the forward pass with the noisy position sequence.
-        if material_property is not None:
-            node_features, edge_index, edge_features = self._encoder_preprocessor(
-                noisy_position_sequence,
-                nparticles_per_example,
-                particle_types,
-                material_property,
-            )
+        if self._lazy_graph_update:
+          if material_property is not None:
+              node_features, edge_index, edge_features = self._encoder_preprocessor_lazy(
+                  noisy_position_sequence, nparticles_per_example, particle_types, material_property)
+          else:
+              node_features, edge_index, edge_features = self._encoder_preprocessor_lazy(
+                  noisy_position_sequence, nparticles_per_example, particle_types)
         else:
-            node_features, edge_index, edge_features = self._encoder_preprocessor(
-                noisy_position_sequence, nparticles_per_example, particle_types
-            )
+          if material_property is not None:
+              node_features, edge_index, edge_features = self._encoder_preprocessor(
+                  noisy_position_sequence, nparticles_per_example, particle_types, material_property)
+          else:
+              node_features, edge_index, edge_features = self._encoder_preprocessor(
+                  noisy_position_sequence, nparticles_per_example, particle_types)
+
         predicted_normalized_acceleration = self._encode_process_decode(
-            node_features, edge_index, edge_features
-        )
+            node_features, edge_index, edge_features)
 
         # Calculate the target acceleration, using an `adjusted_next_position `that
         # is shifted by the noise in the last input position.
         next_position_adjusted = next_positions + position_sequence_noise[:, -1]
         target_normalized_acceleration = self._inverse_decoder_postprocessor(
-            next_position_adjusted, noisy_position_sequence
-        )
+            next_position_adjusted, noisy_position_sequence)
         # As a result the inverted Euler update in the `_inverse_decoder` produces:
         # * A target acceleration that does not explicitly correct for the noise in
         #   the input positions, as the `next_position_adjusted` is different
@@ -409,3 +541,15 @@ def time_diff(position_sequence: torch.tensor) -> torch.tensor:
       torch.tensor: Velocity sequence
     """
     return position_sequence[:, 1:] - position_sequence[:, :-1]
+
+
+@torch.jit.script
+def _get_edge_features(senders: torch.Tensor,
+                        receivers: torch.Tensor,
+                        most_recent_position: torch.Tensor,
+                        one_by_connectivity_radius: torch.Tensor
+                        ) -> torch.Tensor:
+    normalized_relative_displacements = ( most_recent_position[senders, :] - most_recent_position[receivers, :]) * one_by_connectivity_radius
+    normalized_relative_distances = torch.norm(
+        normalized_relative_displacements, dim=-1, keepdim=True)
+    return torch.cat([normalized_relative_displacements, normalized_relative_distances], dim=-1)
