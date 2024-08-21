@@ -8,7 +8,6 @@ import sys
 import wandb
 import numpy as np
 import torch
-from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
@@ -668,7 +667,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
 
                     # Log training loss
                     if verbose:
-                        wandb.log({"Loss/train": train_loss.item()}, step=step)
+                        wandb.log({"Loss/train": train_loss}, step=step)
                         wandb.log({"Learning Rate": lr_new}, step=step)
 
                     avg_loss = epoch_loss / steps_this_epoch
@@ -722,9 +721,9 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                 valid_loss_hist.append((epoch, epoch_valid_loss.item()))
 
             if verbose:
-                wandb.log({"Loss/train_epoch": avg_loss.item()}, step=epoch)
+                wandb.log({"Loss/train_epoch": avg_loss.item()}, step=step)
                 if cfg.training.validation_interval is not None:
-                    wandb.log({"Loss/valid_epoch": epoch_valid_loss.item()}, step=epoch)
+                    wandb.log({"Loss/valid_epoch": epoch_valid_loss.item()}, step=step)
 
             if step >= cfg.training.steps:
                 break
@@ -880,8 +879,8 @@ def main(cfg: Config):
             os.makedirs(cfg.model.path, exist_ok=True)
 
         # Create TensorBoard log directory
-        if not os.path.exists(cfg.logging.tensorboard_dir):
-            os.makedirs(cfg.logging.tensorboard_dir)
+        if not os.path.exists(cfg.logging.wandb_dir):
+            os.makedirs(cfg.logging.wandb_dir)
 
         # Train on gpu
         if device == torch.device("cuda"):

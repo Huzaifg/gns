@@ -55,7 +55,7 @@ class HardwareConfig:
 
 @dataclass
 class LoggingConfig:
-    tensorboard_dir: str = "logs/"
+    wandb_dir: str = "logs/"
 
 
 @dataclass
