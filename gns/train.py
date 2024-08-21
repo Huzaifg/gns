@@ -99,7 +99,7 @@ def rollout(
         )
 
     # Predictions with shape (time, nnodes, dim)
-    predictions = torch.stack(predictions)
+    # predictions = torch.stack(predictions)
     ground_truth_positions = ground_truth_positions.permute(1, 0, 2)
 
     loss = (predictions - ground_truth_positions) ** 2
@@ -132,7 +132,7 @@ def predict(device: str, cfg: DictConfig):
     else:
         raise ValueError("Wrong input: Mixed precision inference does not make any sense")
 
-    if cfg.rollout.graph_build_freq > 1:
+    if cfg.rollout.graph_build_frequency > 1:
         lazy_graph_update = True
     # Read metadata
     metadata = reading_utils.read_metadata(cfg.data.path, "rollout")
@@ -144,7 +144,7 @@ def predict(device: str, cfg: DictConfig):
         device,
         dtype = dtype,
         lazy_graph_update = lazy_graph_update,
-        graph_build_freq = cfg.rollout.graph_build_freq
+        graph_build_freq = cfg.rollout.graph_build_frequency
     )
 
     # Load simulator
