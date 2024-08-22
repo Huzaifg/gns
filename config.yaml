@@ -13,28 +13,28 @@ mode: train
 
 # Data configuration
 data:
-  path: ../gns-sample/WaterDropSample/dataset/
-  batch_size: 2
+  path: ./dem_data/datasets/
+  batch_size: 1
   noise_std: 6.7e-4
   input_sequence_length: 6
   num_particle_types: 9
   kinematic_particle_id: 3
 
-# Model configuration
-model:
-  path: ../gns-sample/WaterDropSample/models/
-  file: model-1500.pt
-  train_state_file: train_state-1500.pt
 
 # Output configuration
 output:
-  path: ../gns-sample/WaterDropSample/rollouts/
+  path: ./dem_data/rollouts/
   filename: rollout
+
+model:
+  path: ./dem_data/models/
+  file: model-29770.pt
+  train_state_file: train_state-29770.pt
 
 # Training configuration
 training:
-  steps: 100
-  validation_interval: null
+  steps: 100000
+  validation_interval: 10000
   save_steps: 500
   resume: False
   dtype_mode: mixed # Options: mixed (Automatic Mixed Precision), single (float32)

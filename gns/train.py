@@ -641,7 +641,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                                     device_id,
                                     do_autocast=do_autocast
                                 )
-                            wandb.log({"Loss/valid": valid_loss.item()}, step=step)
+                                wandb.log({"Loss/valid": valid_loss.item()}, step=step)
 
                         loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
 
