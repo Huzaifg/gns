@@ -9,7 +9,6 @@ import wandb
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 import hydra
@@ -26,6 +25,7 @@ from gns.Dtype import DType
 
 Stats = collections.namedtuple("Stats", ["mean", "std"])
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def rollout(
     simulator: learned_simulator.LearnedSimulator,
@@ -325,34 +325,22 @@ def setup_simulator_and_optimizer(cfg, metadata, rank, world_size, device, use_d
         world_size: Total number of ranks.
         device: torch device type.
     """
-    if device == torch.device("cuda"):
-        serial_simulator = _get_simulator(
-            metadata,
-            cfg.data.num_particle_types,
-            cfg.data.noise_std,
-            cfg.data.noise_std,
-            rank,
-            dtype=dtype
-        )
-        if use_dist:
-            simulator = DDP(serial_simulator.to("cuda"), device_ids=[rank])
-        else:
-            simulator = serial_simulator.to("cuda")
-        optimizer = torch.optim.Adam(
-            simulator.parameters(), lr=cfg.training.learning_rate.initial * world_size
-        )
+    serial_simulator = _get_simulator(
+        metadata,
+        cfg.data.num_particle_types,
+        cfg.data.noise_std,
+        cfg.data.noise_std,
+        rank,
+        device=device,
+        dtype=dtype
+    )
+    if use_dist:
+        simulator = DDP(serial_simulator.to("cuda"), device_ids=[rank])
     else:
-        simulator = _get_simulator(
-            metadata,
-            cfg.data.num_particle_types,
-            cfg.data.noise_std,
-            cfg.data.noise_std,
-            device,
-            dtype=float
-        )
-        optimizer = torch.optim.Adam(
-            simulator.parameters(), lr=cfg.training.learning_rate.initial * world_size
-        )
+        simulator = serial_simulator.to("cuda")
+    optimizer = torch.optim.Adam(
+        simulator.parameters(), lr=cfg.training.learning_rate.initial * world_size
+    )
     return simulator, optimizer
 
 
@@ -485,7 +473,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
     )
 
     # Get simulator and optimizer
-    scaler = GradScaler(enabled = do_autocast) #Grad scaler to prevent gradient vanishing with amp
+    scaler = torch.GradScaler(device, enabled = do_autocast) #Grad scaler to prevent gradient vanishing with amp
 
     # Initialize training state
     step = 0
@@ -568,17 +556,9 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
             epoch_loss = 0.0
             steps_this_epoch = 0
 
-            # Create a tqdm progress bar for each epoch
-            with tqdm(
-                # resume from one step after the checkpoint
-                range(step % len(train_dl) + 1, len(train_dl)),
-                desc=f"Epoch {epoch}",
-                unit="batch",
-                disable=not verbose,
-            ) as pbar:
+            with tqdm(range(step % len(train_dl) + 1, len(train_dl)), desc=f"Epoch {epoch}", unit="batch", disable=not verbose) as pbar:
                 for example in train_dl:
                     steps_per_epoch += 1
-                    # Prepare data
                     (
                         position,
                         particle_type,
@@ -604,19 +584,13 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                     sampled_noise *= non_kinematic_mask.view(-1, 1, 1)
 
                     device_or_rank = rank if device == torch.device("cuda") else device
-                    predict_fn = (
-                        simulator.module.predict_accelerations
-                        if use_dist
-                        else simulator.predict_accelerations
-                    )
-                    with autocast(dtype = torch.float16, enabled = do_autocast):
+                    predict_fn = simulator.module.predict_accelerations if use_dist else simulator.predict_accelerations
+                    with torch.autocast(device, dtype = torch.float16, enabled = do_autocast):
                         pred_acc, target_acc = predict_fn(
                             next_positions=labels.to(device_or_rank),
                             position_sequence_noise=sampled_noise.to(device_or_rank),
                             position_sequence=position.to(device_or_rank),
-                            nparticles_per_example=n_particles_per_example.to(
-                                device_or_rank
-                            ),
+                            nparticles_per_example=n_particles_per_example.to(device_or_rank),
                             particle_types=particle_type.to(device_or_rank),
                             material_property=(
                                 material_property.to(device_or_rank)
@@ -846,7 +820,7 @@ def validation(simulator, example, n_features, cfg, rank, device_id, do_autocast
     )
     # Get the predictions and target accelerations
     with torch.no_grad():
-        with autocast(dtype = torch.float16, enabled = do_autocast):
+        with torch.autocast(device, dtype = torch.float16, enabled = do_autocast):
             pred_acc, target_acc = predict_accelerations(
                 next_positions=labels.to(device_or_rank),
                 position_sequence_noise=sampled_noise.to(device_or_rank),
@@ -867,20 +841,14 @@ def validation(simulator, example, n_features, cfg, rank, device_id, do_autocast
 @hydra.main(version_base=None, config_path="..", config_name="config")
 def main(cfg: Config):
     """Train or evaluates the model."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     local_rank = 0
     use_dist = "LOCAL_RANK" in os.environ
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
 
     if cfg.mode == "train":
-        # If model_path does not exist create new directory.
-        if not os.path.exists(cfg.model.path):
-            os.makedirs(cfg.model.path, exist_ok=True)
-
-        # Create TensorBoard log directory
-        if not os.path.exists(cfg.logging.wandb_dir):
-            os.makedirs(cfg.logging.wandb_dir)
+        os.makedirs(cfg.model.path, exist_ok=True)
+        os.makedirs(cfg.logging.wandb_dir, exist_ok=True)
 
         # Train on gpu
         if device == torch.device("cuda"):

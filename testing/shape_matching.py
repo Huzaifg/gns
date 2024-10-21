@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 
-def shape_matching_update(initial_positions, current_positions, masses, alpha=1, external_forces=None):
+def shape_matching_update(initial_positions, current_positions, masses=None, alpha=1, external_forces=None):
     """
     Updates the current positions by pulling them towards the goal positions based on the initial positions using shape matching.
 
@@ -14,6 +14,8 @@ def shape_matching_update(initial_positions, current_positions, masses, alpha=1,
     :param external_forces: Tensor of external forces (N x 3), default is None
     :return: Tensor of updated positions (N x 3) after being pulled towards the goal positions
     """
+    if masses is None:
+        masses = torch.ones(initial_positions.shape[0], dtype=torch.float32)
 
     # Compute the center of mass of the initial positions
     initial_com = (initial_positions * masses.unsqueeze(-1)
@@ -141,12 +143,9 @@ def main():
         [0.0, 1.1, 1.2]
     ], dtype=torch.float32)
 
-    # Masses for the points
-    masses = torch.tensor([1.0] * 8, dtype=torch.float32)
-
     # Call the shape matching function to get the updated positions
     new_positions = shape_matching_update(
-        initial_positions, current_positions, masses, alpha=0.5)
+        initial_positions, current_positions, alpha=0.5)
 
     # Visualize the initial, current, and updated positions
     visualize_shape_matching(
