@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from gns import graph_network
+from gns.graph_network import EncodeProcessDecode
 from torch_geometric.nn import radius_graph
 from typing import Dict
 from gns.Dtype import DType
-# from testing import shape_matching
 from testing.shape_matching import shape_matching_update
 
 class LearnedSimulator(nn.Module):
@@ -65,12 +64,26 @@ class LearnedSimulator(nn.Module):
 
         self._particle_type_embedding = nn.Embedding(nparticle_types, particle_type_embedding_size)
 
-        self._encode_process_decode = graph_network.EncodeProcessDecode(
+        # should the two encodeprocessdecode add up to nmessage_passing steps?
+        # alpha = 0
+
+        self._encode_process_decode = EncodeProcessDecode(
             nnode_in_features=nnode_in,
             nnode_out_features=particle_dimensions,
             nedge_in_features=nedge_in,
             latent_dim=latent_dim,
             nmessage_passing_steps=nmessage_passing_steps,
+            nmlp_layers=nmlp_layers,
+            mlp_hidden_dim=mlp_hidden_dim,
+            use_amp=self._use_amp
+        )
+
+        self._rigid_body_process = EncodeProcessDecode(
+            nnode_in_features=nnode_in,
+            nnode_out_features=particle_dimensions,
+            nedge_in_features=nedge_in,
+            latent_dim=latent_dim,
+            nmessage_passing_steps=2,
             nmlp_layers=nmlp_layers,
             mlp_hidden_dim=mlp_hidden_dim,
             use_amp=self._use_amp
@@ -217,10 +230,10 @@ class LearnedSimulator(nn.Module):
             material_property
         )
         pred_norm_acceleration = self._encode_process_decode(node_features, edge_index, edge_features)
-        if self._rigid_body_ptype > -1:
-            pred_norm_acceleration = self.update_rigid_body(current_pos, pred_norm_acceleration)
-
         next_pos = self._decoder_postprocessor(pred_norm_acceleration, current_pos)
+
+        if self._rigid_body_ptype > -1:
+            next_pos, _ = self.update_rigid_body(current_pos, particle_types, nparticles_per_example, material_property, pred_norm_acceleration)
 
         return next_pos
 
@@ -245,9 +258,10 @@ class LearnedSimulator(nn.Module):
         Returns:
             Tensors of shape (nparticles_in_batch, dim) with the predicted and target normalized accelerations.
         """
-        
+
         noisy_pos_sequence = pos_sequence + pos_sequence_noise
         next_pos_adjusted = next_pos + pos_sequence_noise[:, -1]
+        target_norm_acceleration = self._inverse_decoder_postprocessor(next_pos_adjusted, noisy_pos_sequence)
 
         node_features, edge_index, edge_features = self._encoder_preprocessor(
             noisy_pos_sequence,
@@ -256,30 +270,56 @@ class LearnedSimulator(nn.Module):
             material_property
         )
         pred_norm_acceleration = self._encode_process_decode(node_features, edge_index, edge_features)
+
         if self._rigid_body_ptype > -1:
-            pred_norm_acceleration = self.update_rigid_body(noisy_pos_sequence, pred_norm_acceleration)
+            corrected_pred_pos, shape_center = self.update_rigid_body(
+                noisy_pos_sequence[:, -1], 
+                particle_types, 
+                nparticles_per_example, 
+                material_property, 
+                pred_norm_acceleration,
+                noisy_pos_sequence[:, 1:]
+            )
+            pred_norm_acceleration = self._inverse_decoder_postprocessor(corrected_pred_pos, noisy_pos_sequence)
+            # returns the corrected_pred_pos as well to enforce a loss on the particles inside the rigid body
+            return pred_norm_acceleration, target_norm_acceleration, corrected_pred_pos, shape_center
 
-        target_norm_acceleration = self._inverse_decoder_postprocessor(next_pos_adjusted, noisy_pos_sequence)
-
-        return pred_norm_acceleration, target_norm_acceleration
+        return pred_norm_acceleration, target_norm_acceleration, None, None
     
     def update_rigid_body(
         self,
-        orig_pos: torch.tensor,
-        new_pos: torch.tensor,
-        particle_types: torch.tensor
+        current_pos,
+        particle_types,
+        nparticles_per_example,
+        material_property,
+        pred_norm_acceleration,
+        pos_sequence=None
     ):
-        """
-        Args:
-            orig_shape: (nparticles, dim)
-            new_pos: (nparticles, dim)
-            particle_types: Particle types with shape (nparticles)
-        """
-        mask = (particle_types == self._rigid_body_ptype)
-        masked_orig_pos = orig_pos[mask]
-        masked_new_pos = new_pos[mask]
-        
-        return shape_matching_update(masked_orig_pos, masked_new_pos)
+        pred_pos = self._decoder_postprocessor(pred_norm_acceleration, current_pos)
+        rigid_body_mask = (particle_types == self._rigid_body_ptype)
+        masked_orig_pos = current_pos[rigid_body_mask]
+        masked_new_pos = pred_pos[rigid_body_mask]
+        corrected_masked_pos = shape_matching_update(masked_orig_pos, masked_new_pos)
+        pred_pos[rigid_body_mask] = corrected_masked_pos
+        if pos_sequence is None:
+            pos_sequence = current_pos
+        # this new sequence is constructed from the 
+        # cur position (if predicting position) 
+        # or the current sequence which has 6 timesteps so remove the first one and concantenate
+        new_seq = torch.cat([pos_sequence, pred_pos.unsqueeze(1)], dim=1)
+        node_features, edge_index, edge_features = self._encoder_preprocessor(
+            new_seq,
+            nparticles_per_example,
+            particle_types,
+            material_property
+        )
+        pred_norm_acceleration = self._rigid_body_process(node_features, edge_index, edge_features)
+        pred_pos = self._decoder_postprocessor(pred_norm_acceleration, pred_pos)
+        # retain the original rigid body positions because we are only pushing the rigid particles out
+        pred_pos[rigid_body_mask] = corrected_masked_pos
+        center = torch.mean(corrected_masked_pos, dim=0)
+
+        return pred_pos, center
 
 
 @torch.jit.script

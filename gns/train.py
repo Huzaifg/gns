@@ -165,7 +165,7 @@ def predict(device: str, cfg: DictConfig):
     # Use `valid`` set for eval mode if not use `test`
     split = (
         "test"
-        if (cfg.mode == "rollout" or (not os.path.isfile("{cfg.data.path}valid.npz")))
+        if (cfg.mode == "rollout" or (not os.path.isfile(f"{cfg.data.path}valid.npz")))
         else "valid"
     )
 
@@ -266,6 +266,22 @@ def acceleration_loss(pred_acc, target_acc, non_kinematic_mask):
     loss = loss.sum() / num_non_kinematic
     return loss
 
+def cube_sdf_loss(pos: torch.tensor, center: torch.tensor, non_kinematic_mask: torch.tensor, side_length: int):
+    """
+    pos: tensor (N, 3)
+    center: tensor (3,)
+    size: int representing side length of cube
+    """
+    resized_center = center.repeat(pos.shape[0]).reshape(-1, 3)
+    offset = torch.abs(pos - resized_center)
+    half_size = side_length / 2
+    
+    is_inside = torch.all(offset <= half_size, dim=-1)
+    is_inside[non_kinematic_mask] = False
+    
+    distances = torch.norm(offset - half_size)
+    scaled_loss = is_inside.reshape(-1, 1) * torch.exp(distances / torch.norm(torch.ones(3) * side_length))
+    return scaled_loss.sum()
 
 def save_model_and_train_state(
     verbose,
@@ -502,36 +518,37 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
             cfg.model.file = f"model-{max_model_number}.pt"
             cfg.model.train_state_file = f"train_state-{max_model_number}.pt"
 
-        if os.path.exists(cfg.model.path + cfg.model.file) and os.path.exists(
-            cfg.model.path + cfg.model.train_state_file
-        ):
-            # load model
-            if use_dist:
-                simulator.module.load(cfg.model.path + cfg.model.file)
-            else:
-                simulator.load(cfg.model.path + cfg.model.file)
+        model_path = cfg.model.path + cfg.model.file
+        model_state_path = cfg.model.path + cfg.model.train_state_file
 
-            # load train state
-            train_state = torch.load(cfg.model.path + cfg.model.train_state_file)
-
-            # set optimizer state
-            optimizer = torch.optim.Adam(
-                simulator.module.parameters() if use_dist else simulator.parameters()
-            )
-            optimizer.load_state_dict(train_state["optimizer_state"])
-            if "scaler" in train_state:
-                scaler.load_state_dict(train_state["scaler"])
-            optimizer_to(optimizer, device_id)
-
-            # set global train state
-            step = train_state["global_train_state"]["step"]
-            epoch = train_state["global_train_state"]["epoch"]
-            train_loss_hist = train_state["loss_history"]["train"]
-            valid_loss_hist = train_state["loss_history"]["valid"]
-
-        else:
-            msg = f"Specified model_file {cfg.model.path + cfg.model.file} and train_state_file {cfg.model.path + cfg.model.train_state_file} not found."
+        if not (os.path.exists(model_path) or os.path.exists(model_state_path)):
+            msg = f"Specified model_file {model_path} and train_state_file {model_state_path} not found."
             raise FileNotFoundError(msg)
+        
+        # load model
+        if use_dist:
+            simulator.module.load(model_path)
+        else:
+            simulator.load(model_path)
+
+        # load train state
+        train_state = torch.load(model_state_path)
+
+        # set optimizer state
+        optimizer = torch.optim.Adam(
+            simulator.module.parameters() if use_dist else simulator.parameters()
+        )
+        optimizer.load_state_dict(train_state["optimizer_state"])
+        if "scaler" in train_state:
+            scaler.load_state_dict(train_state["scaler"])
+        optimizer_to(optimizer, device_id)
+
+        # set global train state
+        step = train_state["global_train_state"]["step"]
+        epoch = train_state["global_train_state"]["epoch"]
+        train_loss_hist = train_state["loss_history"]["train"]
+        valid_loss_hist = train_state["loss_history"]["valid"]
+            
 
     simulator.train()
     simulator.to(device_id)
@@ -586,7 +603,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                     device_or_rank = rank if device == torch.device("cuda") else device
                     predict_fn = simulator.module.predict_accelerations if use_dist else simulator.predict_accelerations
                     with torch.autocast(device, dtype = torch.float16, enabled = do_autocast):
-                        pred_acc, target_acc = predict_fn(
+                        pred_acc, target_acc, pred_pos, shape_center = predict_fn(
                             next_positions=labels.to(device_or_rank),
                             position_sequence_noise=sampled_noise.to(device_or_rank),
                             position_sequence=position.to(device_or_rank),
@@ -603,23 +620,24 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                             cfg.training.validation_interval is not None
                             and step > 0
                             and step % cfg.training.validation_interval == 0
+                            and verbose
                         ):
-                            if verbose:
-                                sampled_valid_example = next(iter(valid_dl))
-                                valid_loss = validation(
-                                    simulator,
-                                    sampled_valid_example,
-                                    n_features,
-                                    cfg,
-                                    rank,
-                                    device_id,
-                                    do_autocast=do_autocast
-                                )
-                                wandb.log({"Loss/valid": valid_loss.item()}, step=step)
+                            sampled_valid_example = next(iter(valid_dl))
+                            valid_loss = validation(
+                                simulator,
+                                sampled_valid_example,
+                                n_features,
+                                cfg,
+                                rank,
+                                device_id,
+                                do_autocast=do_autocast
+                            )
+                            wandb.log({"Loss/valid": valid_loss.item()}, step=step)
 
                         loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
+                        rigid_body_loss = cube_sdf_loss(pred_pos, shape_center, non_kinematic_mask, side_length=2.54)
 
-                    train_loss = loss.item()
+                    train_loss = loss.item() + rigid_body_loss.item()
                     epoch_loss += train_loss
                     steps_this_epoch += 1
 
